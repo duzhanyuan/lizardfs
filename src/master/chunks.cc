@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o..
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
 
@@ -35,15 +35,16 @@
 #include "common/chunks_availability_state.h"
 #include "common/chunk_copies_calculator.h"
 #include "common/compact_vector.h"
+#include "common/counting_sort.h"
 #include "common/coroutine.h"
 #include "common/datapack.h"
 #include "common/exceptions.h"
+#include "common/event_loop.h"
 #include "common/flat_set.h"
 #include "common/goal.h"
 #include "common/hashfn.h"
 #include "common/lizardfs_version.h"
 #include "common/loop_watchdog.h"
-#include "common/main.h"
 #include "common/massert.h"
 #include "common/slice_traits.h"
 #include "common/small_vector.h"
@@ -51,6 +52,7 @@
 #include "master/checksum.h"
 #include "master/chunk_goal_counters.h"
 #include "master/filesystem.h"
+#include "master/get_servers_for_new_chunk.h"
 #include "master/goal_cache.h"
 #include "protocol/MFSCommunication.h"
 
@@ -81,9 +83,11 @@
 
 #ifndef METARESTORE
 
+static uint32_t gRedundancyLevel;
 static uint64_t gEndangeredChunksServingLimit;
 static uint64_t gEndangeredChunksMaxCapacity;
 static uint64_t gDisconnectedCounter = 0;
+bool gAvoidSameIpChunkservers = false;
 
 struct ChunkPart {
 	enum {
@@ -196,7 +200,7 @@ static uint32_t HashSteps;
 static uint32_t HashCPS;
 static uint32_t ChunksLoopPeriod;
 static uint32_t ChunksLoopTimeout;
-static double   AcceptableDifference;
+static double   gAcceptableDifference;
 static bool     RebalancingBetweenLabels = false;
 
 static uint32_t jobsnorepbefore;
@@ -427,7 +431,7 @@ public:
 	}
 
 	bool isLocked() const {
-		return lockedto >= main_time();
+		return lockedto >= eventloop_time();
 	}
 
 	void markCopyAsHavingWrongVersion(ChunkPart &part) {
@@ -559,7 +563,7 @@ public:
 	void serverDisconnected() {
 		refresh();
 		++disconnectedServers_;
-		timestamp_ = main_time() + gOperationsDelayDisconnect;
+		timestamp_ = eventloop_time() + gOperationsDelayDisconnect;
 	}
 
 	void serverConnected() {
@@ -579,7 +583,7 @@ private:
 	uint32_t timestamp_;
 
 	void refresh() {
-		if (main_time() > timestamp_) {
+		if (eventloop_time() > timestamp_) {
 			disconnectedServers_ = 0;
 		}
 	}
@@ -964,7 +968,7 @@ int chunk_can_unlock(uint64_t chunkid, uint32_t lockid) {
 		// lockid == 0 -> force unlock
 		return LIZARDFS_STATUS_OK;
 	}
-	// We will let client unlock the chunk even if c->lockedto < main_time()
+	// We will let client unlock the chunk even if c->lockedto < eventloop_time()
 	// if he provides lockId that was used to lock the chunk -- this means that nobody
 	// else used this chunk since it was locked (operations like truncate or replicate
 	// would remove such a stale lock before modifying the chunk)
@@ -1050,11 +1054,19 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 			uint16_t uscount,tscount;
 			double minusage,maxusage;
 			matocsserv_usagedifference(&minusage,&maxusage,&uscount,&tscount);
-			if ((uscount > 0) && (main_time() > (starttime+600))) { // if there are chunkservers and it's at least one minute after start then it means that there is no space left
+			if ((uscount > 0) && (eventloop_time() > (starttime+600))) { // if there are chunkservers and it's at least one minute after start then it means that there is no space left
 				return LIZARDFS_ERROR_NOSPACE;
 			} else {
 				return LIZARDFS_ERROR_NOCHUNKSERVERS;
 			}
+		}
+		ChunkCopiesCalculator calculator(fs_get_goal_definition(goal));
+		for (const auto &server_with_type : serversWithChunkTypes) {
+			calculator.addPart(server_with_type.second, MediaLabel::kWildcard);
+		}
+		calculator.evalRedundancyLevel();
+		if (!calculator.isSafeEnoughToWrite(gRedundancyLevel)) {
+			return LIZARDFS_ERROR_NOCHUNKSERVERS;
 		}
 		c = chunk_new(gChunksMetadata->nextchunkid++, 1);
 		c->interrupted = 0;
@@ -1087,6 +1099,14 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 		}
 		if (oc->isLost()) {
 			return LIZARDFS_ERROR_CHUNKLOST;
+		}
+		ChunkCopiesCalculator calculator(oc->getGoal());
+		for (auto &part : oc->parts) {
+			calculator.addPart(part.type, MediaLabel::kWildcard);
+		}
+		calculator.evalRedundancyLevel();
+		if (!calculator.isSafeEnoughToWrite(gRedundancyLevel)) {
+			return LIZARDFS_ERROR_NOCHUNKSERVERS;
 		}
 
 		if (oc->fileCount() == 1) { // refcount==1
@@ -1156,7 +1176,7 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 		}
 	}
 
-	c->lockedto = main_time() + LOCKTIMEOUT;
+	c->lockedto = eventloop_time() + LOCKTIMEOUT;
 	if (*lockid == 0) {
 		if (usedummylockid) {
 			*lockid = 1;
@@ -1251,7 +1271,7 @@ uint8_t chunk_multi_truncate(uint64_t ochunkid, uint32_t lockid, uint32_t length
 		}
 	}
 
-	c->lockedto=(uint32_t)main_time()+LOCKTIMEOUT;
+	c->lockedto=(uint32_t)eventloop_time()+LOCKTIMEOUT;
 	c->lockid = lockid;
 	chunk_update_checksum(c);
 	return LIZARDFS_STATUS_OK;
@@ -1516,10 +1536,10 @@ void chunk_server_has_chunk(matocsserventry *ptr, uint64_t chunkid, uint32_t ver
 	if (c==NULL) {
 		// chunkserver has nonexistent chunk, so create it for future deletion
 		if (chunkid>=gChunksMetadata->nextchunkid) {
-			fs_set_nextchunkid(FsContext::getForMaster(main_time()), chunkid + 1);
+			fs_set_nextchunkid(FsContext::getForMaster(eventloop_time()), chunkid + 1);
 		}
 		c = chunk_new(chunkid, new_version);
-		c->lockedto = (uint32_t)main_time()+UNUSED_DELETE_TIMEOUT;
+		c->lockedto = (uint32_t)eventloop_time()+UNUSED_DELETE_TIMEOUT;
 		c->lockid = 0;
 		chunk_update_checksum(c);
 	}
@@ -1617,7 +1637,7 @@ void chunk_server_disconnected(matocsserventry */*ptr*/, const MediaLabel &label
 	// If chunkserver disconnects, we can assure it was processed by zombie server loop
 	// only if the loop was executed at least twice.
 	gDisconnectedCounter = 2;
-	main_make_next_poll_nonblocking();
+	eventloop_make_next_poll_nonblocking();
 	fs_cs_disconnected();
 	gChunksMetadata->lastchunkid = 0;
 	gChunksMetadata->lastchunkptr = NULL;
@@ -1654,7 +1674,7 @@ void chunk_clean_zombie_servers_a_bit() {
 		for (; gCurrentChunkInZombieLoop; gCurrentChunkInZombieLoop = gCurrentChunkInZombieLoop->next) {
 			chunk_handle_disconnected_copies(gCurrentChunkInZombieLoop);
 			if (watchdog.expired()) {
-				main_make_next_poll_nonblocking();
+				eventloop_make_next_poll_nonblocking();
 				return;
 			}
 		}
@@ -1668,7 +1688,7 @@ void chunk_clean_zombie_servers_a_bit() {
 		current_position = 0;
 		gCurrentChunkInZombieLoop = gChunksMetadata->chunkhash[0];
 	}
-	main_make_next_poll_nonblocking();
+	eventloop_make_next_poll_nonblocking();
 }
 
 void chunk_got_delete_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType, uint8_t /*status*/) {
@@ -1846,9 +1866,11 @@ private:
 
 	void deleteInvalidChunkParts(Chunk *c);
 	void deleteAllChunkParts(Chunk *c);
-	bool replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int slice_part, ChunkCopiesCalculator& calc);
-	bool removeUnneededChunkPart(Chunk *c, Goal::Slice::Type slice_type, int slice_part, ChunkCopiesCalculator& calc);
-	bool rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator& calc, bool only_todel);
+	bool replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int slice_part, ChunkCopiesCalculator& calc, const IpCounter &ip_counter);
+	bool removeUnneededChunkPart(Chunk *c, Goal::Slice::Type slice_type, int slice_part,
+	                             ChunkCopiesCalculator& calc, const IpCounter &ip_counter);
+	bool rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator& calc, bool only_todel, const IpCounter &ip_counter);
+	bool rebalanceChunkPartsWithSameIp(Chunk *c, ChunkCopiesCalculator &calc, const IpCounter &ip_counter);
 
 	loop_info inforec_;
 	uint32_t deleteNotDone_;
@@ -1904,7 +1926,7 @@ void ChunkWorker::doEveryLoopTasks() {
 	chunksinfo = inforec_;
 	memset(&inforec_,0,sizeof(inforec_));
 	chunksinfo_loopstart = chunksinfo_loopend;
-	chunksinfo_loopend = main_time();
+	chunksinfo_loopend = eventloop_time();
 }
 
 void ChunkWorker::doEverySecondTasks() {
@@ -1967,7 +1989,7 @@ bool ChunkWorker::tryReplication(Chunk *c, ChunkPartType part_to_recover,
 		calc.addPart(part.type, matocsserv_get_label(part.server()));
 	}
 
-	calc.evalState();
+	calc.evalRedundancyLevel();
 	if (!calc.isRecoveryPossible()) {
 		return false;
 	}
@@ -2043,7 +2065,7 @@ void ChunkWorker::deleteAllChunkParts(Chunk *c) {
 }
 
 bool ChunkWorker::replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int slice_part,
-					ChunkCopiesCalculator &calc) {
+					ChunkCopiesCalculator &calc, const IpCounter &ip_counter) {
 	std::vector<matocsserventry *> servers;
 	int skipped_replications = 0, valid_parts_count = 0, expected_copies = 0;
 	bool tried_to_replicate = false;
@@ -2063,7 +2085,7 @@ bool ChunkWorker::replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int
 	for (const auto &label_and_count : replicate_labels) {
 		tried_to_replicate = true;
 
-		if (jobsnorepbefore >= main_time()) {
+		if (jobsnorepbefore >= eventloop_time()) {
 			break;
 		}
 
@@ -2081,7 +2103,7 @@ bool ChunkWorker::replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int
 		// Get a list of possible destination servers
 		int total_matching, returned_matching, temporarily_unavailable;
 		matocsserv_getservers_lessrepl(label_and_count.first, min_chunkserver_version, MaxWriteRepl,
-		                               servers, total_matching, returned_matching,
+		                               ip_counter, servers, total_matching, returned_matching,
 		                               temporarily_unavailable);
 
 		// Find a destination server for replication -- the first one without a copy of 'c'
@@ -2158,7 +2180,7 @@ bool ChunkWorker::replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int
 }
 
 bool ChunkWorker::removeUnneededChunkPart(Chunk *c, Goal::Slice::Type slice_type, int slice_part,
-					ChunkCopiesCalculator &calc) {
+					ChunkCopiesCalculator &calc, const IpCounter &ip_counter) {
 	Goal::Slice::Labels remove_pool = calc.getRemovePool(slice_type, slice_part);
 	if (remove_pool.empty()) {
 		return false;
@@ -2166,7 +2188,9 @@ bool ChunkWorker::removeUnneededChunkPart(Chunk *c, Goal::Slice::Type slice_type
 
 	ChunkPart *candidate = nullptr;
 	bool candidate_todel = false;
+	int candidate_occurrence = 0;
 	double candidate_usage = std::numeric_limits<double>::lowest();
+
 	for (auto &part : c->parts) {
 		if (!part.is_valid() || part.type != ChunkPartType(slice_type, slice_part)) {
 			continue;
@@ -2182,10 +2206,14 @@ bool ChunkWorker::removeUnneededChunkPart(Chunk *c, Goal::Slice::Type slice_type
 
 		bool is_todel = part.is_todel();
 		double usage = matocsserv_get_usage(part.server());
-		if (std::make_pair(is_todel, usage) > std::make_pair(candidate_todel, candidate_usage)) {
+		int occurrence = ip_counter.empty() ? 1 : ip_counter.at(matocsserv_get_servip(part.server()));
+
+		if (std::make_tuple(is_todel, occurrence, usage) >
+		      std::make_tuple(candidate_todel, candidate_occurrence, candidate_usage)) {
 			candidate = &part;
 			candidate_usage = usage;
 			candidate_todel = is_todel;
+			candidate_occurrence = occurrence;
 		}
 	}
 
@@ -2209,18 +2237,18 @@ bool ChunkWorker::removeUnneededChunkPart(Chunk *c, Goal::Slice::Type slice_type
 	return false;
 }
 
-bool ChunkWorker::rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator &calc, bool only_todel) {
+bool ChunkWorker::rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator &calc, bool only_todel, const IpCounter &ip_counter) {
 	if(!only_todel) {
-		double min_usage = sortedServers_.front().diskUsage;
-		double max_usage = sortedServers_.back().diskUsage;
-		if ((max_usage - min_usage) <= AcceptableDifference) {
+		double min_usage = sortedServers_.front().disk_usage;
+		double max_usage = sortedServers_.back().disk_usage;
+		if ((max_usage - min_usage) <= gAcceptableDifference) {
 			return false;
 		}
 	}
 
 	// Consider each copy to be moved to a server with disk usage much less than actual.
 	// There are at least two servers with a disk usage difference grater than
-	// AcceptableDifference, so it's worth checking.
+	// gAcceptableDifference, so it's worth checking.
 	for (const auto &part : c->parts) {
 		if (!part.is_valid()) {
 			continue;
@@ -2229,6 +2257,10 @@ bool ChunkWorker::rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator &calc, boo
 		if(only_todel && !part.is_todel()) {
 			continue;
 		}
+
+		auto current_ip = matocsserv_get_servip(part.server());
+		auto it = ip_counter.find(current_ip);
+		auto current_ip_count = it != ip_counter.end() ? it->second : 0;
 
 		MediaLabel current_copy_label = matocsserv_get_label(part.server());
 		double current_copy_disk_usage = matocsserv_get_usage(part.server());
@@ -2251,9 +2283,19 @@ bool ChunkWorker::rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator &calc, boo
 		const ServersWithUsage &sorted_servers =
 		        multi_label_rebalance ? sortedServers_
 		                              : labeledSortedServers_[current_copy_label];
+
 		for (const auto &empty_server : sorted_servers) {
-			if (!only_todel && empty_server.diskUsage >
-			    current_copy_disk_usage - AcceptableDifference) {
+			if (!only_todel && gAvoidSameIpChunkservers) {
+				auto empty_server_ip = matocsserv_get_servip(empty_server.server);
+				auto it = ip_counter.find(empty_server_ip);
+				auto empty_server_ip_count = it != ip_counter.end() ? it->second : 0;
+				if (empty_server_ip != current_ip && empty_server_ip_count >= current_ip_count) {
+					continue;
+				}
+			}
+
+			if (!only_todel && empty_server.disk_usage >
+			    current_copy_disk_usage - gAcceptableDifference) {
 				break;  // No more suitable destination servers (next servers have
 				        // higher usage)
 			}
@@ -2275,6 +2317,72 @@ bool ChunkWorker::rebalanceChunkParts(Chunk *c, ChunkCopiesCalculator &calc, boo
 
 	return false;
 }
+
+bool ChunkWorker::rebalanceChunkPartsWithSameIp(Chunk *c, ChunkCopiesCalculator &calc, const IpCounter &ip_counter) {
+	if (!gAvoidSameIpChunkservers) {
+		return false;
+	}
+
+	for (const auto &part : c->parts) {
+		if (!part.is_valid()) {
+			continue;
+		}
+
+		auto current_ip = matocsserv_get_servip(part.server());
+		auto it = ip_counter.find(current_ip);
+		auto current_ip_count = it != ip_counter.end() ? it->second : 0;
+
+		MediaLabel current_copy_label = matocsserv_get_label(part.server());
+
+		bool multi_label_rebalance =
+		        RebalancingBetweenLabels &&
+		        (current_copy_label == MediaLabel::kWildcard ||
+		         calc.canMovePartToDifferentLabel(part.type.getSliceType(),
+		                                          part.type.getSlicePart(),
+		                                          current_copy_label));
+
+		uint32_t min_chunkserver_version = getMinChunkserverVersion(c, part.type);
+
+		const ServersWithUsage &sorted_servers =
+		        multi_label_rebalance ? sortedServers_
+		                              : labeledSortedServers_[current_copy_label];
+
+		ServersWithUsage sorted_by_ip_count;
+		sorted_by_ip_count.resize(sorted_servers.size());
+		counting_sort_copy(sorted_servers.begin(), sorted_servers.end(), sorted_by_ip_count.begin(),
+			           [&ip_counter](const ServerWithUsage& elem) {
+			                  auto ip = matocsserv_get_servip(elem.server);
+			                  auto it = ip_counter.find(ip);
+			                  return it != ip_counter.end() ? it->second : 0;
+			           });
+
+		for (const auto &empty_server : sorted_by_ip_count) {
+			auto empty_server_ip = matocsserv_get_servip(empty_server.server);
+			auto it = ip_counter.find(empty_server_ip);
+			auto empty_server_ip_count = it != ip_counter.end() ? it->second : 0;
+			if (empty_server_ip_count >= (current_ip_count - 1)) {
+				break;
+			}
+
+			if (matocsserv_get_version(empty_server.server) < min_chunkserver_version) {
+				continue;
+			}
+			if (chunkPresentOnServer(c, part.type.getSliceType(), empty_server.server)) {
+				continue;  // A copy is already here
+			}
+			if (matocsserv_replication_write_counter(empty_server.server) >= MaxWriteRepl) {
+				continue;  // We can't create a new copy here
+			}
+			if (tryReplication(c, part.type, empty_server.server)) {
+				inforec_.copy_rebalance++;
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 
 void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 	// step 0. Update chunk's statistics
@@ -2308,6 +2416,16 @@ void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 		}
 	}
 	calc.optimize();
+
+	// step 1a. count number of chunk parts on servers with the same ip
+	IpCounter ip_occurrence;
+	if (gAvoidSameIpChunkservers) {
+		for (auto &part : c->parts) {
+			if (part.is_valid()) {
+				++ip_occurrence[matocsserv_get_servip(part.server())];
+			}
+		}
+	}
 
 	// step 2. check number of copies
 	if (c->isLost() && invalid_parts > 0 && calc.getAvailable().getExpectedCopies() == 0 &&
@@ -2353,7 +2471,7 @@ void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 	// step 7. check if chunk needs any replication
 	for (const auto &slice : calc.getTarget()) {
 		for (int i = 0; i < slice.size(); ++i) {
-			if (replicateChunkPart(c, slice.getType(), i, calc)) {
+			if (replicateChunkPart(c, slice.getType(), i, calc, ip_occurrence)) {
 				return;
 			}
 		}
@@ -2373,14 +2491,14 @@ void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 				continue;
 			}
 
-			if (removeUnneededChunkPart(c, slice.getType(), i, calc)) {
+			if (removeUnneededChunkPart(c, slice.getType(), i, calc, ip_occurrence)) {
 				return;
 			}
 		}
 	}
 
 	// step 9. If chunk has parts marked as "to delete" then move them to other servers
-	if(rebalanceChunkParts(c, calc, true)) {
+	if(rebalanceChunkParts(c, calc, true, ip_occurrence)) {
 		return;
 	}
 
@@ -2388,9 +2506,17 @@ void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 		return;
 	}
 
-	// step 10. if there is too big difference between chunkservers then make copy of chunk from
+	// step 10. Move chunk parts residing on chunkservers with the same ip.
+	if (rebalanceChunkPartsWithSameIp(c, calc, ip_occurrence)) {
+		return;
+	}
+
+	// step 11. if there is too big difference between chunkservers then make copy of chunk from
 	// a server with a high disk usage on a server with low disk usage
-	rebalanceChunkParts(c, calc, false);
+	if (rebalanceChunkParts(c, calc, false, ip_occurrence)) {
+		return;
+	}
+
 }
 
 bool ChunkWorker::deleteUnusedChunks() {
@@ -2444,7 +2570,7 @@ void ChunkWorker::mainLoop() {
 		stack_.chunks_done_count = 0;
 		stack_.buckets_done_count = 0;
 
-		if (starttime + gOperationsDelayInit > main_time()) {
+		if (starttime + gOperationsDelayInit > eventloop_time()) {
 			return;
 		}
 
@@ -2458,7 +2584,7 @@ void ChunkWorker::mainLoop() {
 
 		doEverySecondTasks();
 
-		if (jobsnorepbefore < main_time()) {
+		if (jobsnorepbefore < eventloop_time()) {
 			stack_.endangered_to_serve = gEndangeredChunksServingLimit;
 			while (stack_.endangered_to_serve > 0 && !Chunk::endangeredChunks.empty()) {
 				c = Chunk::endangeredChunks.front();
@@ -2541,7 +2667,7 @@ void chunk_jobs_process_bit(void) {
 	if (!gChunkWorker->is_complete()) {
 		gChunkWorker->mainLoop();
 		if (!gChunkWorker->is_complete()) {
-			main_make_next_poll_nonblocking();
+			eventloop_make_next_poll_nonblocking();
 		}
 	}
 }
@@ -2674,11 +2800,11 @@ void chunk_newfs(void) {
 
 #ifndef METARESTORE
 void chunk_become_master() {
-	starttime = main_time();
+	starttime = eventloop_time();
 	jobsnorepbefore = starttime + gOperationsDelayInit;
 	gChunkWorker = std::unique_ptr<ChunkWorker>(new ChunkWorker());
-	gChunkLoopEventHandle = main_timeregister_ms(ChunksLoopPeriod, chunk_jobs_main);
-	main_eachloopregister(chunk_jobs_process_bit);
+	gChunkLoopEventHandle = eventloop_timeregister_ms(ChunksLoopPeriod, chunk_jobs_main);
+	eventloop_eachloopregister(chunk_jobs_process_bit);
 	return;
 }
 
@@ -2691,6 +2817,8 @@ void chunk_reload(void) {
 	gOperationsDelayDisconnect = cfg_getuint32("REPLICATIONS_DELAY_DISCONNECT", 3600);
 	gOperationsDelayInit = cfg_getuint32("OPERATIONS_DELAY_INIT", gOperationsDelayInit);
 	gOperationsDelayDisconnect = cfg_getuint32("OPERATIONS_DELAY_DISCONNECT", gOperationsDelayDisconnect);
+	gAvoidSameIpChunkservers = cfg_getuint32("AVOID_SAME_IP_CHUNKSERVERS", 0);
+	gRedundancyLevel = cfg_getuint32("REDUNDANCY_LEVEL", 0);
 
 	uint32_t disableChunksDel = cfg_getuint32("DISABLE_CHUNKS_DEL", 0);
 	if (disableChunksDel) {
@@ -2739,7 +2867,7 @@ void chunk_reload(void) {
 
 	ChunksLoopPeriod = cfg_get_minmaxvalue<uint32_t>("CHUNKS_LOOP_PERIOD", 1000, MINCHUNKSLOOPPERIOD, MAXCHUNKSLOOPPERIOD);
 	if (gChunkLoopEventHandle) {
-		main_timechange_ms(gChunkLoopEventHandle, ChunksLoopPeriod);
+		eventloop_timechange_ms(gChunkLoopEventHandle, ChunksLoopPeriod);
 	}
 
 	repl = cfg_get_minmaxvalue<uint32_t>("CHUNKS_LOOP_MAX_CPU", 60, MINCHUNKSLOOPCPU, MAXCHUNKSLOOPCPU);
@@ -2760,7 +2888,7 @@ void chunk_reload(void) {
 	double endangeredChunksPriority = cfg_ranged_get("ENDANGERED_CHUNKS_PRIORITY", 0.0, 0.0, 1.0);
 	gEndangeredChunksServingLimit = HashSteps * endangeredChunksPriority;
 	gEndangeredChunksMaxCapacity = cfg_get("ENDANGERED_CHUNKS_MAX_CAPACITY", static_cast<uint64_t>(1024*1024UL));
-	AcceptableDifference = cfg_ranged_get("ACCEPTABLE_DIFFERENCE",0.1, 0.001, 10.0);
+	gAcceptableDifference = cfg_ranged_get("ACCEPTABLE_DIFFERENCE",0.1, 0.001, 10.0);
 	RebalancingBetweenLabels = cfg_getuint32("CHUNKS_REBALANCING_BETWEEN_LABELS", 0) == 1;
 }
 #endif
@@ -2783,6 +2911,9 @@ int chunk_strinit(void) {
 	gOperationsDelayDisconnect = cfg_getuint32("REPLICATIONS_DELAY_DISCONNECT", 3600);
 	gOperationsDelayInit = cfg_getuint32("OPERATIONS_DELAY_INIT", gOperationsDelayInit);
 	gOperationsDelayDisconnect = cfg_getuint32("OPERATIONS_DELAY_DISCONNECT", gOperationsDelayDisconnect);
+	gAvoidSameIpChunkservers = cfg_getuint32("AVOID_SAME_IP_CHUNKSERVERS", 0);
+	gRedundancyLevel = cfg_getuint32("REDUNDANCY_LEVEL", 0);
+
 	if (disableChunksDel) {
 		MaxDelHardLimit = MaxDelSoftLimit = 0;
 	} else {
@@ -2837,15 +2968,14 @@ int chunk_strinit(void) {
 	double endangeredChunksPriority = cfg_ranged_get("ENDANGERED_CHUNKS_PRIORITY", 0.0, 0.0, 1.0);
 	gEndangeredChunksServingLimit = HashSteps * endangeredChunksPriority;
 	gEndangeredChunksMaxCapacity = cfg_get("ENDANGERED_CHUNKS_MAX_CAPACITY", static_cast<uint64_t>(1024*1024UL));
-	AcceptableDifference = cfg_ranged_get("ACCEPTABLE_DIFFERENCE", 0.1, 0.001, 10.0);
+	gAcceptableDifference = cfg_ranged_get("ACCEPTABLE_DIFFERENCE", 0.1, 0.001, 10.0);
 	RebalancingBetweenLabels = cfg_getuint32("CHUNKS_REBALANCING_BETWEEN_LABELS", 0) == 1;
-	main_reloadregister(chunk_reload);
+	eventloop_reloadregister(chunk_reload);
 	metadataserver::registerFunctionCalledOnPromotion(chunk_become_master);
-	main_eachloopregister(chunk_clean_zombie_servers_a_bit);
+	eventloop_eachloopregister(chunk_clean_zombie_servers_a_bit);
 	if (metadataserver::isMaster()) {
 		chunk_become_master();
 	}
 #endif
 	return 1;
 }
-

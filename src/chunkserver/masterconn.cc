@@ -40,6 +40,7 @@
 #include "chunkserver/network_main_thread.h"
 #include "common/cfg.h"
 #include "common/datapack.h"
+#include "common/event_loop.h"
 #include "common/goal.h"
 #include "common/loop_watchdog.h"
 #include "common/main.h"
@@ -70,7 +71,18 @@
 enum {FREE,CONNECTING,CONNECTED,KILL};
 
 struct masterconn {
-	masterconn() : inputPacket(MaxPacketSize) {}
+	masterconn()
+	: mode(),
+	  sock(),
+	  pdescpos(),
+	  lastread(),
+	  lastwrite(),
+	  inputPacket(MaxPacketSize),
+	  outputPackets(),
+	  bindip(),
+	  masterip(),
+	  masterport(),
+	  masteraddrvalid() {}
 
 	int mode;
 	int sock;
@@ -83,6 +95,8 @@ struct masterconn {
 	uint16_t masterport;
 	uint8_t masteraddrvalid;
 };
+
+static const uint64_t kSendStatusDelay = 5;
 
 static masterconn *masterconnsingleton=NULL;
 static void *jpool;
@@ -101,6 +115,8 @@ static std::string gLabel;
 static uint64_t stats_bytesout=0;
 static uint64_t stats_bytesin=0;
 static uint32_t stats_maxjobscnt=0;
+
+static bool gEnableLoadFactor;
 
 // static FILE *logfd;
 
@@ -776,6 +792,20 @@ void masterconn_desc(std::vector<pollfd> &pdesc) {
 	}
 }
 
+void masterconn_send_status() {
+	static uint8_t prev_factor = 0;
+	masterconn *eptr = masterconnsingleton;
+
+	if (gEnableLoadFactor) {
+		uint8_t load_factor = hdd_get_load_factor();
+		if (eptr->mode == CONNECTED && load_factor != prev_factor) {
+			masterconn_create_attached_packet(eptr,
+				cstoma::status::build(load_factor));
+			prev_factor = load_factor;
+		}
+	}
+}
+
 void masterconn_serve(const std::vector<pollfd> &pdesc) {
 	LOG_AVG_TILL_END_OF_SCOPE0("master_serve");
 	masterconn *eptr = masterconnsingleton;
@@ -861,6 +891,8 @@ void masterconn_reload(void) {
 	MasterPort = cfg_getstr("MASTER_PORT","9420");
 	BindHost = cfg_getstr("BIND_HOST","*");
 
+	gEnableLoadFactor = cfg_getuint32("ENABLE_LOAD_FACTOR", 0);
+
 	if (eptr->masteraddrvalid && eptr->mode!=FREE) {
 		uint32_t mip,bip;
 		uint16_t mport;
@@ -896,7 +928,7 @@ void masterconn_reload(void) {
 		masterconn_sendregisterlabel(eptr);
 	}
 
-	main_timechange(reconnect_hook,TIMEMODE_RUN_LATE,ReconnectionDelay,0);
+	eventloop_timechange(reconnect_hook,TIMEMODE_RUN_LATE,ReconnectionDelay,0);
 }
 
 int masterconn_init(void) {
@@ -909,6 +941,7 @@ int masterconn_init(void) {
 	BindHost = cfg_getstr("BIND_HOST","*");
 	Timeout_ms = get_cfg_timeout();
 //      BackLogsNumber = cfg_getuint32("BACK_LOGS",50);
+	gEnableLoadFactor = cfg_getuint32("ENABLE_LOAD_FACTOR", 0);
 
 	if (!masterconn_load_label()) {
 		return -1;
@@ -925,11 +958,12 @@ int masterconn_init(void) {
 		return -1;
 	}
 
-	main_eachloopregister(masterconn_check_hdd_reports);
-	reconnect_hook = main_timeregister(TIMEMODE_RUN_LATE,ReconnectionDelay,rnd_ranged<uint32_t>(ReconnectionDelay),masterconn_reconnect);
-	main_destructregister(masterconn_term);
-	main_pollregister(masterconn_desc,masterconn_serve);
-	main_reloadregister(masterconn_reload);
+	eventloop_eachloopregister(masterconn_check_hdd_reports);
+	eventloop_timeregister(TIMEMODE_RUN_LATE, kSendStatusDelay, rnd_ranged<uint32_t>(kSendStatusDelay), masterconn_send_status);
+	reconnect_hook = eventloop_timeregister(TIMEMODE_RUN_LATE,ReconnectionDelay,rnd_ranged<uint32_t>(ReconnectionDelay),masterconn_reconnect);
+	eventloop_destructregister(masterconn_term);
+	eventloop_pollregister(masterconn_desc,masterconn_serve);
+	eventloop_reloadregister(masterconn_reload);
 	return 0;
 }
 

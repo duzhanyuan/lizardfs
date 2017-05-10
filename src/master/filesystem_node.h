@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017
    Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
@@ -22,6 +22,7 @@
 #include "common/platform.h"
 #include "master/filesystem_node_types.h"
 #include "master/filesystem_metadata.h"
+#include "protocol/directory_entry.h"
 
 inline uint32_t fsnodes_hash(uint32_t parentid, const hstorage::Handle &name) {
 	return (parentid * 0x5F2318BD) + name.hash();
@@ -128,13 +129,13 @@ uint8_t verify_session(const FsContext &context, OperationMode operationMode,
 	SessionType sessionType);
 
 uint8_t fsnodes_get_node_for_operation(const FsContext &context, ExpectedNodeType expectedNodeType,
-	uint8_t modemask, uint32_t inode, FSNode **ret);
+	uint8_t modemask, uint32_t inode, FSNode **ret, FSNodeDirectory **ret_rn = nullptr);
 uint8_t fsnodes_undel(uint32_t ts, FSNodeFile *node);
 
 int fsnodes_namecheck(const std::string &name);
 void fsnodes_get_stats(FSNode *node, statsrecord *sr);
 bool fsnodes_isancestor_or_node_reserved_or_trash(FSNodeDirectory *f, FSNode *p);
-int fsnodes_access(FSNode *node, uint32_t uid, uint32_t gid, uint8_t modemask, uint8_t sesflags);
+int fsnodes_access(const FsContext &context, FSNode *node, uint8_t modemask);
 
 void fsnodes_setlength(FSNodeFile *obj, uint64_t length);
 void fsnodes_change_uid_gid(FSNode *p, uint32_t uid, uint32_t gid);
@@ -158,6 +159,10 @@ uint32_t fsnodes_getdirsize(const FSNodeDirectory *p, uint8_t withattr);
 void fsnodes_getdirdata(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t auid,
 	uint32_t agid, uint8_t sesflags, FSNodeDirectory *p, uint8_t *dbuff,
 	uint8_t withattr);
+void fsnodes_getdir(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t auid,
+		uint32_t agid, uint8_t sesflags, FSNodeDirectory *p,
+		uint64_t first_entry, uint64_t number_of_entries,
+		std::vector<DirectoryEntry> &dir_entries);
 void fsnodes_checkfile(FSNodeFile *p, uint32_t chunkcount[CHUNK_MATRIX_SIZE]);
 
 bool fsnodes_has_tape_goal(FSNode *node);
@@ -188,3 +193,4 @@ uint32_t fsnodes_getpath_size(FSNodeDirectory *parent, FSNode *child);
 void fsnodes_getpath_data(FSNodeDirectory *parent, FSNode *child, uint8_t *path, uint32_t size);
 
 int64_t fsnodes_get_size(FSNode *node);
+FSNodeDirectory *fsnodes_get_first_parent(FSNode *node);

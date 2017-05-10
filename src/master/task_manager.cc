@@ -1,5 +1,5 @@
 /*
-   Copyright 2016 Skytechnology sp. z o.o.
+   Copyright 2016-2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -21,14 +21,20 @@
 #include "master/task_manager.h"
 
 #include "common/loop_watchdog.h"
+#include "master/filesystem_metadata.h"
+#include "master/filesystem_node.h"
 #include "protocol/MFSCommunication.h"
+
+void TaskManager::Job::finalize(int status) {
+	if (finish_callback_) {
+		finish_callback_(status);
+	}
+	tasks_.clear_and_dispose([](Task *ptr) { delete ptr; });
+}
 
 void TaskManager::Job::finalizeTask(TaskIterator itask, int status) {
 	if (status || (itask->isFinished() && tasks_.size() <= 1)) {
-		if (finish_callback_) {
-			finish_callback_(status);
-		}
-		tasks_.clear_and_dispose([](Task *ptr) { delete ptr; });
+		finalize(status);
 	} else if (itask->isFinished()) {
 		tasks_.erase_and_dispose(itask, [](Task *ptr) { delete ptr; });
 	}
@@ -42,9 +48,13 @@ void TaskManager::Job::processTask(uint32_t ts) {
 	}
 }
 
-int TaskManager::submitTask(uint32_t ts, int initial_batch_size, Task *task,
-			    const std::function<void(int)> &callback) {
-	Job new_job;
+JobInfo TaskManager::Job::getInfo() const {
+	return { id_, description_ };
+}
+
+int TaskManager::submitTask(uint32_t taskid, uint32_t ts, int initial_batch_size, Task *task,
+	                    const std::string &description, const std::function<void(int)> &callback) {
+	Job new_job(taskid, description);
 
 	int done = 0;
 	int status = LIZARDFS_STATUS_OK;
@@ -73,6 +83,11 @@ int TaskManager::submitTask(uint32_t ts, int initial_batch_size, Task *task,
 	return LIZARDFS_ERROR_WAITING;
 }
 
+int TaskManager::submitTask(uint32_t ts, int initial_batch_size, Task *task,
+	                    const std::string &description, const std::function<void(int)> &callback) {
+	return submitTask(reserveJobId(), ts, initial_batch_size, task, description, callback);
+}
+
 void TaskManager::processJobs(uint32_t ts, int number_of_tasks) {
 	SignalLoopWatchdog watchdog;
 	JobIterator it = job_list_.begin();
@@ -91,4 +106,23 @@ void TaskManager::processJobs(uint32_t ts, int number_of_tasks) {
 			it = job_list_.begin();
 		}
 	}
+}
+
+TaskManager::JobsInfoContainer TaskManager::getCurrentJobsInfo() const {
+	JobsInfoContainer info;
+	info.reserve(job_list_.size());
+	for (const Job &j : job_list_) {
+		info.push_back(j.getInfo());
+	}
+	return info;
+}
+
+bool TaskManager::cancelJob(uint32_t job_id) {
+	for (auto it = job_list_.begin(); it != job_list_.end(); ++it) {
+		if (it->getId() == job_id) {
+			it->finalize(LIZARDFS_ERROR_NOTDONE);
+			return true;
+		}
+	}
+	return false;
 }

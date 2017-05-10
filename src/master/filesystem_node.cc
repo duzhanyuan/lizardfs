@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017
    Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
@@ -301,6 +301,17 @@ int64_t fsnodes_get_size(FSNode *node) {
 	return sr.size;
 }
 
+FSNodeDirectory *fsnodes_get_first_parent(FSNode *node) {
+	assert(node);
+	FSNodeDirectory *parent;
+	if (!node->parent.empty()) {
+		parent = fsnodes_id_to_node_verify<FSNodeDirectory>(node->parent[0]);
+	} else {
+		parent = gMetadata->root;
+	}
+	return parent;
+}
+
 static inline void fsnodes_sub_stats(FSNodeDirectory *parent, statsrecord *sr) {
 	statsrecord *psr;
 	if (parent) {
@@ -362,7 +373,7 @@ void fsnodes_fill_attr(FSNode *node, FSNode *parent, uint32_t uid, uint32_t gid,
 	uint16_t mode;
 	uint32_t nlink;
 	(void)sesflags;
-	ptr = attr;
+	ptr = attr.data();
 	if (node->type == FSNode::kTrash || node->type == FSNode::kReserved) {
 		put8bit(&ptr, FSNode::kFile);
 	} else {
@@ -551,10 +562,12 @@ FSNode *fsnodes_create_node(uint32_t ts, FSNodeDirectory *parent, const HString 
 			static_cast<FSNodeDirectory*>(node)->defaultAcl.reset(new AccessControlList(*parent->defaultAcl));
 		}
 		// Join ACL's access mask without cleaning sticky bits etc.
-		node->mode &= ~0777 | (parent->defaultAcl->mode);
-		if (parent->defaultAcl->extendedAcl) {
-			node->extendedAcl.reset(new ExtendedAcl(*parent->defaultAcl->extendedAcl));
-		}
+		node->mode = (node->mode & ~0777) | parent->defaultAcl->getMode();
+		node->extendedAcl.reset(new AccessControlList(*parent->defaultAcl));
+
+		// Set effective permissions as the intersection of mode and ACL
+		node->mode &= mode | ~0777;
+		node->extendedAcl->setMode(node->mode);
 	} else {
 		// Apply umask
 		node->mode &= ~(umask & 0777);  // umask must be applied manually
@@ -767,8 +780,8 @@ void fsnodes_getdirdata(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t
 	Attributes attr;
 	if (withattr) {
 		fsnodes_fill_attr(p, p, uid, gid, auid, agid, sesflags, attr);
-		::memcpy(dbuff, attr, sizeof(attr));
-		dbuff += sizeof(attr);
+		::memcpy(dbuff, attr.data(), attr.size());
+		dbuff += attr.size();
 	} else {
 		put8bit(&dbuff, FSNode::kDirectory);
 	}
@@ -781,8 +794,8 @@ void fsnodes_getdirdata(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t
 		put32bit(&dbuff, SPECIAL_INODE_ROOT);
 		if (withattr) {
 			fsnodes_fill_attr(p, p, uid, gid, auid, agid, sesflags, attr);
-			::memcpy(dbuff, attr, sizeof(attr));
-			dbuff += sizeof(attr);
+			::memcpy(dbuff, attr.data(), attr.size());
+			dbuff += attr.size();
 		} else {
 			put8bit(&dbuff, FSNode::kDirectory);
 		}
@@ -797,25 +810,25 @@ void fsnodes_getdirdata(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t
 				FSNode *parent = fsnodes_id_to_node_verify<FSNode>(p->parent[0]);
 				fsnodes_fill_attr(parent, p, uid, gid, auid, agid,
 				                  sesflags, attr);
-				::memcpy(dbuff, attr, sizeof(attr));
+				::memcpy(dbuff, attr.data(), attr.size());
 			} else {
 				if (rootinode == SPECIAL_INODE_ROOT) {
 					fsnodes_fill_attr(gMetadata->root, p, uid, gid, auid, agid,
 					                  sesflags, attr);
-					::memcpy(dbuff, attr, sizeof(attr));
+					::memcpy(dbuff, attr.data(), attr.size());
 				} else {
 					FSNode *rn = fsnodes_id_to_node(rootinode);
 					if (rn) {  // it should be always true because it's checked
 						   // before, but better check than sorry
 						fsnodes_fill_attr(rn, p, uid, gid, auid, agid,
 						                  sesflags, attr);
-						::memcpy(dbuff, attr, sizeof(attr));
+						::memcpy(dbuff, attr.data(), attr.size());
 					} else {
-						memset(dbuff, 0, sizeof(attr));
+						memset(dbuff, 0, attr.size());
 					}
 				}
 			}
-			dbuff += sizeof(attr);
+			dbuff += attr.size();
 		} else {
 			put8bit(&dbuff, FSNode::kDirectory);
 		}
@@ -831,11 +844,75 @@ void fsnodes_getdirdata(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t
 		put32bit(&dbuff, entry.second->id);
 		if (withattr) {
 			fsnodes_fill_attr(entry.second, p, uid, gid, auid, agid, sesflags, attr);
-			::memcpy(dbuff, attr, sizeof(attr));
-			dbuff += sizeof(attr);
+			::memcpy(dbuff, attr.data(), attr.size());
+			dbuff += attr.size();
 		} else {
 			put8bit(&dbuff, entry.second->type);
 		}
+	}
+}
+
+void fsnodes_getdir(uint32_t rootinode, uint32_t uid, uint32_t gid, uint32_t auid, uint32_t agid,
+		uint8_t sesflags, FSNodeDirectory *p, uint64_t first_entry,
+		uint64_t number_of_entries, std::vector<DirectoryEntry> &dir_entries) {
+	FSNodeDirectory *parent;
+	uint32_t inode;
+	Attributes attr;
+
+	if (first_entry == 0 && number_of_entries >= 1) {
+		inode = p->id != rootinode ? p->id : SPECIAL_INODE_ROOT;
+		parent = fsnodes_id_to_node_verify<FSNodeDirectory>(
+		        p->parent.empty() ? SPECIAL_INODE_ROOT : p->parent[0]);
+		fsnodes_fill_attr(p, parent, uid, gid, auid, agid, sesflags, attr);
+		dir_entries.emplace_back(std::move(inode), std::string("."), std::move(attr));
+
+		first_entry++;
+		number_of_entries--;
+	}
+
+	if (first_entry == 1 && number_of_entries >= 1) {
+		if (p->id == rootinode) {
+			inode = SPECIAL_INODE_ROOT;
+			parent = fsnodes_id_to_node_verify<FSNodeDirectory>(
+			        p->parent.empty() ? SPECIAL_INODE_ROOT : p->parent[0]);
+			fsnodes_fill_attr(p, parent, uid, gid, auid, agid, sesflags, attr);
+		} else {
+			if (!p->parent.empty() && p->parent[0] != rootinode) {
+				inode = p->parent[0];
+			} else {
+				inode = SPECIAL_INODE_ROOT;
+			}
+
+			FSNodeDirectory *grandparent;
+			parent = fsnodes_id_to_node_verify<FSNodeDirectory>(
+			        p->parent.empty() ? SPECIAL_INODE_ROOT : p->parent[0]);
+			grandparent = fsnodes_id_to_node_verify<FSNodeDirectory>(
+			        parent->parent.empty() ? SPECIAL_INODE_ROOT : parent->parent[0]);
+			fsnodes_fill_attr(parent, grandparent, uid, gid, auid, agid, sesflags,
+			                  attr);
+		}
+		dir_entries.emplace_back(std::move(inode), std::string(".."), std::move(attr));
+
+		first_entry++;
+		number_of_entries--;
+	}
+
+	if (number_of_entries == 0) {
+		return;
+	}
+	assert(first_entry >= 2);
+
+	std::string name;
+	auto it = p->find_nth(first_entry - 2);
+	while (it != p->end() && number_of_entries > 0) {
+		name = (std::string)(*it).first;
+		inode = (*it).second->id;
+		fsnodes_fill_attr((*it).second, p, uid, gid, auid, agid, sesflags, attr);
+
+		dir_entries.emplace_back(std::move(inode), std::move(name), std::move(attr));
+
+		++it;
+		--number_of_entries;
 	}
 }
 
@@ -1469,6 +1546,9 @@ void fsnodes_seteattr_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint8_t
 		}
 		if (neweattr != (node->mode >> 12)) {
 			node->mode = (node->mode & 0xFFF) | (((uint16_t)neweattr) << 12);
+			if (node->extendedAcl) {
+				node->extendedAcl->setMode(node->mode);
+			}
 			(*sinodes)++;
 			fsnodes_update_ctime(node, ts);
 		} else {
@@ -1510,8 +1590,8 @@ uint8_t fsnodes_getacl(FSNode *p, AclType type, AccessControlList &acl) {
 		if (!p->extendedAcl) {
 			return LIZARDFS_ERROR_ENOATTR;
 		}
-		acl.mode = (p->mode & 0777);
-		acl.extendedAcl.reset(new ExtendedAcl(*p->extendedAcl));
+		acl = *p->extendedAcl;
+		assert((p->mode & 0777) == p->extendedAcl->getMode());
 	}
 	return LIZARDFS_STATUS_OK;
 }
@@ -1524,8 +1604,8 @@ uint8_t fsnodes_setacl(FSNode *p, AclType type, AccessControlList acl, uint32_t 
 		}
 		static_cast<FSNodeDirectory*>(p)->defaultAcl.reset(new AccessControlList(std::move(acl)));
 	} else {
-		p->mode = (p->mode & ~0777) | (acl.mode & 0777);
-		p->extendedAcl = std::move(acl.extendedAcl);
+		p->mode = (p->mode & ~0777) | (acl.getMode() & 0777);
+		p->extendedAcl.reset(new AccessControlList(std::move(acl)));
 	}
 	fsnodes_update_ctime(p, ts);
 	fsnodes_update_checksum(p);
@@ -1553,19 +1633,29 @@ int fsnodes_namecheck(const std::string &name) {
 	return 0;
 }
 
-int fsnodes_access(FSNode *node, uint32_t uid, uint32_t gid, uint8_t modemask, uint8_t sesflags) {
+int fsnodes_access(const FsContext &context, FSNode *node, uint8_t modemask) {
 	uint8_t nodemode;
-	if ((sesflags & SESFLAG_NOMASTERPERMCHECK) || uid == 0) {
+	if ((context.sesflags() & SESFLAG_NOMASTERPERMCHECK) || context.uid() == 0) {
 		return 1;
 	}
-	if (uid == node->uid || (node->mode & (EATTR_NOOWNER << 12))) {
-		nodemode = ((node->mode) >> 6) & 7;
-	} else if (sesflags & SESFLAG_IGNOREGID) {
-		nodemode = (((node->mode) >> 3) | (node->mode)) & 7;
-	} else if (gid == node->gid) {
-		nodemode = ((node->mode) >> 3) & 7;
+	if (node->extendedAcl) {
+		assert((node->mode & 0777) == node->extendedAcl->getMode());
+
+		if (context.uid() == node->uid && (node->mode & (EATTR_NOOWNER << 12))) {
+			nodemode = node->extendedAcl->getEntry(AccessControlList::kUser, 0).access_rights;
+		} else {
+			nodemode = node->extendedAcl->getEffectiveRights(node->uid, node->gid, context.uid(), context.groups());
+		}
 	} else {
-		nodemode = (node->mode & 7);
+		if (context.uid() == node->uid || (node->mode & (EATTR_NOOWNER << 12))) {
+			nodemode = ((node->mode) >> 6) & 7;
+		} else if (context.sesflags() & SESFLAG_IGNOREGID) {
+			nodemode = (((node->mode) >> 3) | (node->mode)) & 7;
+		} else if (context.hasGroup(node->gid)) {
+			nodemode = ((node->mode) >> 3) & 7;
+		} else {
+			nodemode = (node->mode & 7);
+		}
 	}
 	if ((nodemode & modemask) == modemask) {
 		return 1;
@@ -1610,14 +1700,17 @@ uint8_t verify_session(const FsContext &context, OperationMode operationMode,
  * Can return a reserved node or a node from trash
  */
 uint8_t fsnodes_get_node_for_operation(const FsContext &context, ExpectedNodeType expectedNodeType,
-					uint8_t modemask, uint32_t inode, FSNode **ret) {
+					uint8_t modemask, uint32_t inode, FSNode **ret, FSNodeDirectory **ret_rn) {
 	FSNode *p;
+	FSNodeDirectory *rn;
 	if (!context.hasSessionData()) {
+		rn = nullptr;
 		p = fsnodes_id_to_node(inode);
 		if (!p) {
 			return LIZARDFS_ERROR_ENOENT;
 		}
 	} else if (context.rootinode() == SPECIAL_INODE_ROOT || (context.rootinode() == 0)) {
+		rn = gMetadata->root;
 		p = fsnodes_id_to_node(inode);
 		if (!p) {
 			return LIZARDFS_ERROR_ENOENT;
@@ -1626,7 +1719,7 @@ uint8_t fsnodes_get_node_for_operation(const FsContext &context, ExpectedNodeTyp
 			return LIZARDFS_ERROR_EPERM;
 		}
 	} else {
-		FSNodeDirectory *rn = fsnodes_id_to_node<FSNodeDirectory>(context.rootinode());
+		rn = fsnodes_id_to_node<FSNodeDirectory>(context.rootinode());
 		if (!rn || rn->type != FSNode::kDirectory) {
 			return LIZARDFS_ERROR_ENOENT;
 		}
@@ -1652,11 +1745,18 @@ uint8_t fsnodes_get_node_for_operation(const FsContext &context, ExpectedNodeTyp
 	    (p->type != FSNode::kReserved) && (p->type != FSNode::kTrash)) {
 		return LIZARDFS_ERROR_EPERM;
 	}
+	if ((expectedNodeType == ExpectedNodeType::kFileOrDirectory) && (p->type != FSNode::kDirectory)
+		&& (p->type != FSNode::kFile) && (p->type != FSNode::kReserved) && (p->type != FSNode::kTrash)) {
+		return LIZARDFS_ERROR_EPERM;
+	}
 	if (context.canCheckPermissions() &&
-	    !fsnodes_access(p, context.uid(), context.gid(), modemask, context.sesflags())) {
+	    !fsnodes_access(context, p, modemask)) {
 		return LIZARDFS_ERROR_EACCES;
 	}
 	*ret = p;
+	if (ret_rn) {
+		*ret_rn = rn;
+	}
 	return LIZARDFS_STATUS_OK;
 }
 

@@ -1,5 +1,5 @@
 /*
-   Copyright 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o.
+   Copyright 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -17,10 +17,13 @@
  */
 
 #include "common/platform.h"
+
 #include "master/get_servers_for_new_chunk.h"
 
 #include "common/massert.h"
 #include "common/random.h"
+#include "master/chunks.h"
+#include "master/matocsserv.h"
 
 void GetServersForNewChunk::prepareData(ChunkCreationHistory &history) {
 	// To avoid overflows (weight * chunksCreatedSoFar), we will reset history every million
@@ -46,7 +49,7 @@ void GetServersForNewChunk::prepareData(ChunkCreationHistory &history) {
 	if (history.empty()) {
 		for (const auto &server : servers_) {
 			history.emplace_back(server.server, server.label, server.weight,
-			                     server.version);
+			                     server.version, server.load_factor);
 		}
 	}
 
@@ -59,12 +62,45 @@ void GetServersForNewChunk::prepareData(ChunkCreationHistory &history) {
 	// random_shuffle to choose randomly if relative disk usage is the same.
 	std::random_shuffle(servers_.begin(), servers_.end());
 	std::stable_sort(servers_.begin(), servers_.end(),
-	                 [](const ChunkserverChunkCounter &a, const ChunkserverChunkCounter &b) {
-		                 int64_t aRelativeUsage = a.chunks_created * b.weight;
-		                 int64_t bRelativeUsage = b.chunks_created * a.weight;
-		                 return (aRelativeUsage < bRelativeUsage ||
-		                         (aRelativeUsage == bRelativeUsage && a.weight > b.weight));
-		         });
+				 [](const ChunkserverChunkCounter &a, const ChunkserverChunkCounter &b) {
+					 int64_t aRelativeUsage = a.chunks_created * b.weight;
+					 int64_t bRelativeUsage = b.chunks_created * a.weight;
+					 return std::make_tuple(aRelativeUsage, -a.weight, a.load_factor)
+					 < std::make_tuple(bRelativeUsage, -b.weight, b.load_factor);
+			 });
+
+	if (gAvoidSameIpChunkservers) {
+		sortAvoidingSameIp();
+	}
+}
+
+void GetServersForNewChunk::sortAvoidingSameIp() {
+	IpCounter ip_counter;
+	small_vector<int, 16> occurrence_offset(1);
+	std::vector<int> serv_occurrence_no(servers_.size(), 0);
+
+	int tmp_index;
+	uint32_t tmp_ip;
+	for (size_t i = 0; i < servers_.size(); ++i) {
+		tmp_ip = matocsserv_get_servip(servers_[i].server);
+		tmp_index = ip_counter[tmp_ip]++;
+		serv_occurrence_no[i] = tmp_index;
+		assert(tmp_index < (int)occurrence_offset.size());
+		if (tmp_index + 1 >= (int)occurrence_offset.size()) {
+			occurrence_offset.push_back(1);
+		} else {
+			++occurrence_offset[tmp_index + 1];
+		}
+	}
+	for (size_t i = 1; i < occurrence_offset.size(); ++i) {
+		occurrence_offset[i] += occurrence_offset[i - 1];
+	}
+	std::vector<ChunkserverChunkCounter> new_order(servers_.size());
+	for (size_t i = 0; i < servers_.size(); ++i) {
+		tmp_index = occurrence_offset[serv_occurrence_no[i]]++;
+		new_order[tmp_index] = servers_[i];
+	}
+	servers_ = std::move(new_order);
 }
 
 std::vector<matocsserventry *> GetServersForNewChunk::chooseServersForLabels(

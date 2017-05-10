@@ -29,7 +29,6 @@
 #include "common/access_control_list.h"
 #include "common/acl_type.h"
 #include "common/attributes.h"
-#include "common/extended_acl.h"
 #include "common/goal.h"
 #include "common/compact_vector.h"
 
@@ -60,7 +59,7 @@ enum class AclInheritance { kInheritAcl, kDontInheritAcl };
 // Arguments for verify_session
 enum class SessionType { kNotMeta, kOnlyMeta, kAny };
 enum class OperationMode { kReadWrite, kReadOnly };
-enum class ExpectedNodeType { kFile, kDirectory, kNotDirectory, kAny };
+enum class ExpectedNodeType { kFile, kDirectory, kNotDirectory, kFileOrDirectory, kAny };
 
 typedef std::unordered_map<uint32_t, uint32_t> TrashtimeMap;
 typedef std::array<uint32_t, GoalId::kMax + 1> GoalStatistics;
@@ -113,7 +112,7 @@ struct FSNode {
 	uint32_t gid; /*!< Group id. */
 	uint32_t trashtime; /*!< Trash time. */
 
-	std::unique_ptr<ExtendedAcl> extendedAcl; /*!< Access control list. */
+	std::unique_ptr<AccessControlList> extendedAcl; /*!< Access control list. */
 	compact_vector<uint32_t, uint32_t> parent; /*!< Parent nodes ids. To reduce memory usage ids
 	                                                are stored instead of pointers to FSNode. */
 
@@ -279,6 +278,14 @@ struct FSNodeDirectory : public FSNode {
 		}
 
 		return it;
+	}
+
+	iterator find_nth(EntriesContainer::size_type nth) {
+		return entries.find_nth(nth);
+	}
+
+	const_iterator find_nth(EntriesContainer::size_type nth) const {
+		return entries.find_nth(nth);
 	}
 
 	/*! \brief Returns name for specified node.

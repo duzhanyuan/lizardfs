@@ -66,6 +66,7 @@
 #include "chunkserver/chunk_filename_parser.h"
 #include "chunkserver/chunk_signature.h"
 #include "chunkserver/indexed_resource_pool.h"
+#include "chunkserver/iostat.h"
 #include "chunkserver/open_chunk.h"
 #include "common/cfg.h"
 #include "common/cwrap.h"
@@ -75,8 +76,8 @@
 #include "common/debug_log.h"
 #include "common/disk_info.h"
 #include "common/exceptions.h"
+#include "common/event_loop.h"
 #include "common/list.h"
-#include "common/main.h"
 #include "common/massert.h"
 #include "common/moosefs_vector.h"
 #include "common/random.h"
@@ -192,6 +193,7 @@ static std::atomic<uint32_t> stats_duptrunc(0);
 
 static const int kOpenRetryCount = 4;
 static const int kOpenRetry_ms = 5;
+static IoStat gIoStat;
 
 void hdd_report_damaged_chunk(uint64_t chunkid, ChunkPartType chunk_type) {
 	TRACETHIS1(chunkid);
@@ -1151,6 +1153,10 @@ void hdd_get_space(uint64_t *usedspace,uint64_t *totalspace,uint32_t *chunkcount
 	*tdchunkcount = tdchunks;
 }
 
+int hdd_get_load_factor() {
+	return gIoStat.getLoadFactor();
+}
+
 static inline int hdd_int_chunk_readcrc(MooseFSChunk *c, uint32_t chunk_version) {
 	TRACETHIS();
 	ChunkSignature chunkSignature;
@@ -1245,7 +1251,7 @@ static int hdd_io_begin(Chunk *c,int newflag, uint32_t chunk_version = std::nume
 		gOpenChunks.acquire(c->fd);
 		if (c->fd < 0) {
 			// Try to free some long unused descriptors
-			gOpenChunks.freeUnused(main_time(), hashlock);
+			gOpenChunks.freeUnused(eventloop_time(), hashlock);
 			for (int i = 0; i < kOpenRetryCount; ++i) {
 				if (newflag) {
 					c->fd = open(c->filename().c_str(), O_RDWR | O_TRUNC | O_CREAT, 0666);
@@ -1283,7 +1289,7 @@ static int hdd_io_begin(Chunk *c,int newflag, uint32_t chunk_version = std::nume
 				status = hdd_int_chunk_readcrc(mc, chunk_version);
 				if (status != LIZARDFS_STATUS_OK) {
 					int errmem = errno;
-					gOpenChunks.release(c->fd, main_time());
+					gOpenChunks.release(c->fd, eventloop_time());
 					lzfs_silent_errlog(LOG_WARNING,
 							"hdd_io_begin: file:%s - read error", c->filename().c_str());
 					errno = errmem;
@@ -1346,7 +1352,7 @@ static int hdd_io_end(Chunk *c) {
 	}
 	c->refcount--;
 	if (c->refcount==0) {
-		gOpenChunks.release(c->fd, main_time());
+		gOpenChunks.release(c->fd, eventloop_time());
 	}
 	errno = 0;
 	return LIZARDFS_STATUS_OK;
@@ -1404,8 +1410,11 @@ int hdd_close(uint64_t chunkid, ChunkPartType chunkType) {
 #ifdef LIZARDFS_HAVE_THREAD_LOCAL
 
 uint8_t* hdd_get_block_buffer() {
-	static thread_local std::array<uint8_t, kHddBlockSize> blockbuffer;
-	return blockbuffer.data();
+	// Pad in order to make block data aligned in cache (helps CRC)
+	static constexpr int kMaxCacheLine = 64;
+	static constexpr int kPadding = kMaxCacheLine - sizeof(uint32_t);
+	static thread_local std::array<uint8_t, kHddBlockSize + kPadding> blockbuffer;
+	return blockbuffer.data() + kPadding;
 }
 
 uint8_t* hdd_get_header_buffer() {
@@ -1416,13 +1425,16 @@ uint8_t* hdd_get_header_buffer() {
 #else // LIZARDFS_HAVE_THREAD_LOCAL
 
 uint8_t* hdd_get_block_buffer() {
-	auto blockbuffer = (uint8_t*)pthread_getspecific(blockbufferkey);
+	// Pad in order to make block data aligned in cache (helps CRC)
+	static constexpr int kMaxCacheLine = 64;
+	static constexpr int kPadding = kMaxCacheLine - sizeof(uint32_t);
+	uint8_t *blockbuffer = (uint8_t*)pthread_getspecific(blockbufferkey);
 	if (blockbuffer==NULL) {
-		blockbuffer = (uint8_t*)malloc(kHddBlockSize);
+		blockbuffer = (uint8_t*)malloc(kHddBlockSize + kPadding);
 		passert(blockbuffer);
 		zassert(pthread_setspecific(blockbufferkey,blockbuffer));
 	}
-	return blockbuffer;
+	return blockbuffer + kPadding;
 }
 
 uint8_t* hdd_get_header_buffer() {
@@ -1472,7 +1484,7 @@ int hdd_read_crc_and_block(Chunk* c, uint16_t blocknum, OutputBuffer* outputBuff
 		} else do {
 			assert(c->chunkFormat() == ChunkFormat::INTERLEAVED);
 			uint8_t* crcBuff = hdd_get_block_buffer();
-			uint8_t* data = crcBuff + 4;
+			uint8_t* data = crcBuff + sizeof(uint32_t);
 			auto containsZerosOnly = [](uint8_t* buffer, uint32_t size) {
 				return buffer[0] == 0 && !memcmp(buffer, buffer + 1, size - 1);
 			};
@@ -1484,7 +1496,7 @@ int hdd_read_crc_and_block(Chunk* c, uint16_t blocknum, OutputBuffer* outputBuff
 				// It looks like this is a sparse file with an empty block. Let's check it
 				// and if that's the case let's recompute the CRC
 
-				bytesRead = pread(c->fd, data, MFSBLOCKSIZE, off + 4);
+				bytesRead = pread(c->fd, data, MFSBLOCKSIZE, off + sizeof(uint32_t));
 				if (bytesRead != MFSBLOCKSIZE) {
 					break;
 				}
@@ -1655,13 +1667,12 @@ void hdd_int_recompute_crc_if_block_empty(uint8_t* block, uint8_t* crcBuffer) {
  * Returns number of read bytes on success, -1 on failure.
  * Assumes blockBuffer can fit both data and CRC.
  */
-int hdd_int_read_block_and_crc(Chunk* c, uint8_t* blockBuffer, uint8_t* crcBuffer,
-		uint16_t blocknum, const char* errorMsg) {
+int hdd_int_read_block_and_crc(Chunk* c, uint8_t* blockBuffer, uint16_t blocknum, const char* errorMsg) {
 	IF_MOOSEFS_CHUNK(mc, c) {
 		sassert(c->chunkFormat() == ChunkFormat::MOOSEFS);
 		uint8_t *crc_data = gOpenChunks.getResource(mc->fd).crc_data();
-		memcpy(crcBuffer, crc_data + blocknum * sizeof(uint32_t), serializedSize(uint32_t()));
-		if (pread(mc->fd, blockBuffer, MFSBLOCKSIZE, mc->getBlockOffset(blocknum))
+		memcpy(blockBuffer, crc_data + blocknum * sizeof(uint32_t), sizeof(uint32_t));
+		if (pread(mc->fd, blockBuffer + sizeof(uint32_t), MFSBLOCKSIZE, mc->getBlockOffset(blocknum))
 				!= MFSBLOCKSIZE) {
 			hdd_error_occured(mc);   // uses and preserves errno !!!
 			lzfs_silent_errlog(LOG_WARNING,
@@ -1680,9 +1691,7 @@ int hdd_int_read_block_and_crc(Chunk* c, uint8_t* blockBuffer, uint8_t* crcBuffe
 			hdd_report_damaged_chunk(c->chunkid, c->type());
 			return -1;
 		}
-		memcpy(crcBuffer, blockBuffer, 4);
-		memmove(blockBuffer, blockBuffer + 4, MFSBLOCKSIZE);
-		hdd_int_recompute_crc_if_block_empty(blockBuffer, crcBuffer);
+		hdd_int_recompute_crc_if_block_empty(blockBuffer + sizeof(uint32_t), blockBuffer);
 		return kHddBlockSize;
 	}
 }
@@ -1796,8 +1805,7 @@ int hdd_write(Chunk* chunk, uint32_t version,
 	TRACETHIS3(chunk->chunkid, offset, size);
 	uint32_t precrc, postcrc, combinedcrc, chcrc;
 	uint64_t ts, te;
-	uint8_t *blockbuffer;
-	blockbuffer = hdd_get_block_buffer();
+
 	if (chunk->version != version && version > 0) {
 		return LIZARDFS_ERROR_WRONGVERSION;
 	}
@@ -1813,9 +1821,9 @@ int hdd_write(Chunk* chunk, uint32_t version,
 	if (crc != mycrc32(0, buffer, size)) {
 		return LIZARDFS_ERROR_CRC;
 	}
-	uint8_t crcBuff[sizeof(uint32_t)];
 	chunk->wasChanged = true;
 	if (offset == 0 && size == MFSBLOCKSIZE) {
+		uint8_t crcBuff[sizeof(uint32_t)];
 		if (blocknum >= chunk->blocks) {
 			uint16_t prevBlocks = chunk->blocks;
 			chunk->blocks = blocknum + 1;
@@ -1829,8 +1837,6 @@ int hdd_write(Chunk* chunk, uint32_t version,
 		ts = get_usectime();
 		uint8_t *crcBuffPointer = crcBuff;
 		put32bit(&crcBuffPointer, crc);
-		memcpy(blockbuffer, crcBuff, 4);
-		memcpy(blockbuffer + 4, buffer, MFSBLOCKSIZE);
 
 		int written =
 		    hdd_int_write_block_and_crc(chunk, buffer, crcBuff, blocknum, "write_block_to_chunk");
@@ -1840,18 +1846,20 @@ int hdd_write(Chunk* chunk, uint32_t version,
 		te = get_usectime();
 		hdd_stats_datawrite(chunk->owner, written, te - ts);
 	} else {
+		uint8_t *blockbuffer = hdd_get_block_buffer();
 		if (blocknum < chunk->blocks) {
 			ts = get_usectime();
-			auto readBytes = hdd_int_read_block_and_crc(chunk, blockbuffer, crcBuff, blocknum,
+			auto readBytes = hdd_int_read_block_and_crc(chunk, blockbuffer, blocknum,
 			                                            "write_block_to_chunk");
+			uint8_t *data_in_buffer = blockbuffer + sizeof(uint32_t); // Skip crc
 			if (readBytes < 0) {
 				return LIZARDFS_ERROR_IO;
 			}
 			te = get_usectime();
 			hdd_stats_dataread(chunk->owner, readBytes, te - ts);
-			precrc = mycrc32(0, blockbuffer, offset);
-			chcrc = mycrc32(0, blockbuffer + offset, size);
-			postcrc = mycrc32(0, blockbuffer + offset + size, MFSBLOCKSIZE - (offset + size));
+			precrc = mycrc32(0, data_in_buffer, offset);
+			chcrc = mycrc32(0, data_in_buffer + offset, size);
+			postcrc = mycrc32(0, data_in_buffer + offset + size, MFSBLOCKSIZE - (offset + size));
 			if (offset == 0) {
 				combinedcrc = mycrc32_combine(chcrc, postcrc, MFSBLOCKSIZE - (offset + size));
 			} else {
@@ -1861,7 +1869,7 @@ int hdd_write(Chunk* chunk, uint32_t version,
 					    mycrc32_combine(combinedcrc, postcrc, MFSBLOCKSIZE - (offset + size));
 				}
 			}
-			const uint8_t *crcBuffPointer = crcBuff;
+			const uint8_t *crcBuffPointer = blockbuffer;
 			const uint8_t **tmpPtr = &crcBuffPointer;
 			if (get32bit(tmpPtr) != combinedcrc) {
 				errno = 0;
@@ -1899,9 +1907,9 @@ int hdd_write(Chunk* chunk, uint32_t version,
 				combinedcrc = mycrc32_combine(combinedcrc, postcrc, MFSBLOCKSIZE - (offset + size));
 			}
 		}
-		uint8_t *crcBuffPointer = crcBuff;
+		uint8_t *crcBuffPointer = blockbuffer;
 		put32bit(&crcBuffPointer, combinedcrc);
-		int written = hdd_int_write_partial_block_and_crc(chunk, buffer, offset, size, crcBuff,
+		int written = hdd_int_write_partial_block_and_crc(chunk, buffer, offset, size, blockbuffer,
 		                                                   blocknum, "write_block_to_chunk");
 		if (written < 0) {
 			return LIZARDFS_ERROR_IO;
@@ -2065,17 +2073,17 @@ static int hdd_int_test(uint64_t chunkid, uint32_t version, ChunkPartType chunkT
 		hdd_chunk_release(c);
 		return status;
 	}
-	uint8_t crcBuff[sizeof(uint32_t)];
 	status = LIZARDFS_STATUS_OK; // will be overwritten in the loop below if the test fails
 	for (block=0 ; block<c->blocks ; block++) {
-		auto readBytes = hdd_int_read_block_and_crc(c, blockbuffer, crcBuff, block, "test_chunk");
+		auto readBytes = hdd_int_read_block_and_crc(c, blockbuffer, block, "test_chunk");
+		uint8_t *data_in_buffer = blockbuffer + sizeof(uint32_t); // Skip crc
 		if (readBytes < 0) {
 			status = LIZARDFS_ERROR_IO;
 			break;
 		}
 		hdd_stats_read(readBytes);
-		const uint8_t* crcBuffPointer = crcBuff;
-		if (get32bit(&crcBuffPointer) != mycrc32(0, blockbuffer, MFSBLOCKSIZE)) {
+		const uint8_t* crcBuffPointer = blockbuffer;
+		if (get32bit(&crcBuffPointer) != mycrc32(0, data_in_buffer, MFSBLOCKSIZE)) {
 			errno = 0;      // set anything to errno
 			hdd_error_occured(c);   // uses and preserves errno !!!
 			syslog(LOG_WARNING, "test_chunk: file:%s - crc error", c->filename().c_str());
@@ -2693,11 +2701,11 @@ static int hdd_int_duptrunc(uint64_t chunkId, uint32_t chunkVersion, uint32_t ch
 			}
 			hdd_stats_read(toBeRead);
 			if (c->chunkFormat() == ChunkFormat::INTERLEAVED) {
-				crc = mycrc32_zeroexpanded(0, blockbuffer + 4, lastBlockSize, MFSBLOCKSIZE - lastBlockSize);
+				crc = mycrc32_zeroexpanded(0, blockbuffer + sizeof(uint32_t), lastBlockSize, MFSBLOCKSIZE - lastBlockSize);
 				uint8_t* crcBuffPointer = blockbuffer;
 				put32bit(&crcBuffPointer, crc);
 			} else {
-				auto* ptr = hdrbuffer + mc->getCrcOffset() + 4 * block;
+				auto* ptr = hdrbuffer + mc->getCrcOffset() + sizeof(uint32_t) * block;
 				auto crc = mycrc32_zeroexpanded(0, blockbuffer, lastBlockSize, MFSBLOCKSIZE - lastBlockSize);
 				put32bit(&ptr,crc);
 			}
@@ -3320,7 +3328,7 @@ void hdd_free_resources_thread() {
 	TRACETHIS();
 
 	while (!term) {
-		gOpenChunks.freeUnused(main_time(), hashlock, kMaxFreeUnused);
+		gOpenChunks.freeUnused(eventloop_time(), hashlock, kMaxFreeUnused);
 		sleep(kDelayedStep);
 	}
 }
@@ -3396,7 +3404,7 @@ void hdd_term(void) {
 				syslog(LOG_WARNING,"hdd_term: locked chunk !!!");
 			}
 		}
-		gOpenChunks.freeUnused(main_time(), hashlock);
+		gOpenChunks.freeUnused(eventloop_time(), hashlock);
 	}
 	for (f=folderhead ; f ; f=fn) {
 		fn = f->next;
@@ -3804,6 +3812,15 @@ static void hdd_folders_reinit(void) {
 		folderactions = 1; // continue folder actions
 	}
 
+	std::unique_lock<std::mutex> folderlock_lock(folderlock);
+	std::vector<std::string> paths;
+	for (f = folderhead; f; f = f->next) {
+		paths.emplace_back(f->path);
+	}
+	folderlock_lock.unlock();
+
+	gIoStat.resetPaths(paths);
+
 	if (!anyDiskAvailable) {
 		throw InitializeException("no data paths defined in the " + hddfname + " file");
 	}
@@ -3931,9 +3948,9 @@ int hdd_init(void) {
 
 	MooseFSChunkFormat = true;
 	hdd_int_set_chunk_format();
-	main_reloadregister(hdd_reload);
-	main_timeregister(TIMEMODE_RUN_LATE,60,0,hdd_diskinfo_movestats);
-	main_destructregister(hdd_term);
+	eventloop_reloadregister(hdd_reload);
+	eventloop_timeregister(TIMEMODE_RUN_LATE,60,0,hdd_diskinfo_movestats);
+	eventloop_destructregister(hdd_term);
 
 	term = 1;
 

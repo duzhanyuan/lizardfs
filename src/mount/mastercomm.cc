@@ -1368,7 +1368,7 @@ uint8_t fs_access(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t modemask) {
 	return ret;
 }
 
-uint8_t fs_lookup(uint32_t parent,uint8_t nleng,const uint8_t *name,uint32_t uid,uint32_t gid,uint32_t *inode,uint8_t attr[35]) {
+uint8_t fs_lookup(uint32_t parent, uint8_t nleng, const uint8_t *name, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1396,13 +1396,49 @@ uint8_t fs_lookup(uint32_t parent,uint8_t nleng,const uint8_t *name,uint32_t uid
 	} else {
 		t32 = get32bit(&rptr);
 		*inode = t32;
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
 }
 
-uint8_t fs_getattr(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t attr[35]) {
+uint8_t fs_whole_path_lookup(uint32_t parent, const std::string &name, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
+	threc *rec = fs_get_my_threc();
+	auto message = cltoma::wholePathLookup::build(rec->packetId, parent, name, uid, gid);
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_WHOLE_PATH_LOOKUP, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	try {
+		uint32_t msgid;
+		PacketVersion packet_version;
+		deserializePacketVersionNoHeader(message, packet_version);
+		if (packet_version == matocl::wholePathLookup::kStatusPacketVersion) {
+			uint8_t status;
+			matocl::wholePathLookup::deserialize(message, msgid, status);
+			if (status == LIZARDFS_STATUS_OK) {
+				fs_got_inconsistent("LIZ_MATOCL_WHOLE_PATH_LOOKUP", message.size(),
+				                    "version 0 and LIZARDFS_STATUS_OK");
+				return LIZARDFS_ERROR_IO;
+			}
+			return status;
+		} else if (packet_version == matocl::wholePathLookup::kResponsePacketVersion) {
+			matocl::wholePathLookup::deserialize(message, msgid, *inode, attr);
+			return LIZARDFS_STATUS_OK;
+		} else {
+			fs_got_inconsistent("LIZ_MATOCL_WHOLE_PATH_LOOKUP", message.size(),
+					"unknown version " + std::to_string(packet_version));
+			return LIZARDFS_ERROR_IO;
+		}
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_WHOLE_PATH_LOOKUP", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_getattr(uint32_t inode, uint32_t uid, uint32_t gid, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1420,17 +1456,17 @@ uint8_t fs_getattr(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t attr[35]) {
 		ret = LIZARDFS_ERROR_IO;
 	} else if (i==1) {
 		ret = rptr[0];
-	} else if (i!=35) {
+	} else if (i != attr.size()) {
 		setDisconnect(true);
 		ret = LIZARDFS_ERROR_IO;
 	} else {
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
 }
 
-uint8_t fs_setattr(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t setmask,uint16_t attrmode,uint32_t attruid,uint32_t attrgid,uint32_t attratime,uint32_t attrmtime,uint8_t sugidclearmode,uint8_t attr[35]) {
+uint8_t fs_setattr(uint32_t inode, uint32_t uid, uint32_t gid, uint8_t setmask, uint16_t attrmode, uint32_t attruid, uint32_t attrgid, uint32_t attratime, uint32_t attrmtime, uint8_t sugidclearmode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1461,11 +1497,11 @@ uint8_t fs_setattr(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t setmask,uint
 		ret = LIZARDFS_ERROR_IO;
 	} else if (i==1) {
 		ret = rptr[0];
-	} else if (i!=35) {
+	} else if (i != attr.size()) {
 		setDisconnect(true);
 		ret = LIZARDFS_ERROR_IO;
 	} else {
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
@@ -1601,7 +1637,7 @@ uint8_t fs_readlink(uint32_t inode,const uint8_t **path) {
 	return ret;
 }
 
-uint8_t fs_symlink(uint32_t parent,uint8_t nleng,const uint8_t *name,const uint8_t *path,uint32_t uid,uint32_t gid,uint32_t *inode,uint8_t attr[35]) {
+uint8_t fs_symlink(uint32_t parent, uint8_t nleng, const uint8_t *name, const uint8_t *path, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1627,13 +1663,13 @@ uint8_t fs_symlink(uint32_t parent,uint8_t nleng,const uint8_t *name,const uint8
 		ret = LIZARDFS_ERROR_IO;
 	} else if (i==1) {
 		ret = rptr[0];
-	} else if (i!=39) {
+	} else if (i != (attr.size() + 4)) {
 		setDisconnect(true);
 		ret = LIZARDFS_ERROR_IO;
 	} else {
 		t32 = get32bit(&rptr);
 		*inode = t32;
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
@@ -1777,7 +1813,7 @@ uint8_t fs_rmdir(uint32_t parent,uint8_t nleng,const uint8_t *name,uint32_t uid,
 	return ret;
 }
 
-uint8_t fs_rename(uint32_t parent_src,uint8_t nleng_src,const uint8_t *name_src,uint32_t parent_dst,uint8_t nleng_dst,const uint8_t *name_dst,uint32_t uid,uint32_t gid,uint32_t *inode,uint8_t attr[35]) {
+uint8_t fs_rename(uint32_t parent_src, uint8_t nleng_src, const uint8_t *name_src, uint32_t parent_dst, uint8_t nleng_dst, const uint8_t *name_dst, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1804,20 +1840,20 @@ uint8_t fs_rename(uint32_t parent_src,uint8_t nleng_src,const uint8_t *name_src,
 	} else if (i==1) {
 		ret = rptr[0];
 		*inode = 0;
-		memset(attr,0,35);
-	} else if (i!=39) {
+		attr.fill(0);
+	} else if (i != (attr.size() + 4)) {
 		setDisconnect(true);
 		ret = LIZARDFS_ERROR_IO;
 	} else {
 		t32 = get32bit(&rptr);
 		*inode = t32;
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
 }
 
-uint8_t fs_link(uint32_t inode_src,uint32_t parent_dst,uint8_t nleng_dst,const uint8_t *name_dst,uint32_t uid,uint32_t gid,uint32_t *inode,uint8_t attr[35]) {
+uint8_t fs_link(uint32_t inode_src, uint32_t parent_dst, uint8_t nleng_dst, const uint8_t *name_dst, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1840,13 +1876,13 @@ uint8_t fs_link(uint32_t inode_src,uint32_t parent_dst,uint8_t nleng_dst,const u
 		ret = LIZARDFS_ERROR_IO;
 	} else if (i==1) {
 		ret = rptr[0];
-	} else if (i!=39) {
+	} else if (i != (attr.size() + 4)) {
 		setDisconnect(true);
 		ret = LIZARDFS_ERROR_IO;
 	} else {
 		t32 = get32bit(&rptr);
 		*inode = t32;
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
@@ -1910,9 +1946,48 @@ uint8_t fs_getdir_plus(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t addtocac
 	return ret;
 }
 
+uint8_t fs_getdir(uint32_t inode, uint32_t uid, uint32_t gid, uint64_t first_entry,
+		uint64_t max_entries, std::vector<DirectoryEntry> &dir_entries) {
+	threc *rec = fs_get_my_threc();
+	auto message =
+	        cltoma::fuseGetDir::build(rec->packetId, inode, uid, gid, first_entry, max_entries);
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_GETDIR, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	try {
+		uint32_t message_id;
+		PacketVersion packet_version;
+		deserializePacketVersionNoHeader(message, packet_version);
+		if (packet_version == matocl::fuseGetDir::kStatus) {
+			uint8_t status;
+			matocl::fuseGetDir::deserialize(message, message_id, status);
+			if (status == LIZARDFS_STATUS_OK) {
+				fs_got_inconsistent("LIZ_MATOCL_FUSE_GETDIR", message.size(),
+				                    "version 0 and LIZARDFS_STATUS_OK");
+				return LIZARDFS_ERROR_IO;
+			}
+			return status;
+		} else if (packet_version == matocl::fuseGetDir::kResponse) {
+			matocl::fuseGetDir::deserialize(message, message_id, first_entry,
+			                                dir_entries);
+			return LIZARDFS_STATUS_OK;
+		} else {
+			fs_got_inconsistent("LIZ_MATOCL_FUSE_GETDIR", message.size(),
+			                    "unknown version " + std::to_string(packet_version));
+			return LIZARDFS_ERROR_IO;
+		}
+	} catch (Exception &ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_GETDIR", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
 // FUSE - I/O
 
-uint8_t fs_opencheck(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t flags,uint8_t attr[35]) {
+uint8_t fs_opencheck(uint32_t inode, uint32_t uid, uint32_t gid, uint8_t flags, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -1931,14 +2006,10 @@ uint8_t fs_opencheck(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t flags,uint
 	if (rptr==NULL) {
 		ret = LIZARDFS_ERROR_IO;
 	} else if (i==1) {
-		if (attr) {
-			memset(attr,0,35);
-		}
+		attr.fill(0);
 		ret = rptr[0];
-	} else if (i==35) {
-		if (attr) {
-			memcpy(attr,rptr,35);
-		}
+	} else if (i == attr.size()) {
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	} else {
 		setDisconnect(true);
@@ -1948,6 +2019,27 @@ uint8_t fs_opencheck(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t flags,uint
 		fs_dec_acnt(inode);
 	}
 	return ret;
+}
+
+uint8_t fs_update_credentials(uint32_t key, const GroupCache::Groups &gids) {
+	threc* rec = fs_get_my_threc();
+	std::vector<uint8_t> message;
+	cltoma::updateCredentials::serialize(message, rec->packetId, key, gids);
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_UPDATE_CREDENTIALS, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	try {
+		uint8_t status;
+		uint32_t msgid;
+		matocl::updateCredentials::deserialize(message, msgid, status);
+		return status;
+	} catch (Exception& ex) {
+		setDisconnect(true);
+		return LIZARDFS_ERROR_IO;
+	}
 }
 
 void fs_release(uint32_t inode) {
@@ -2233,7 +2325,7 @@ uint8_t fs_gettrash(const uint8_t **dbuff,uint32_t *dbuffsize) {
 	return ret;
 }
 
-uint8_t fs_getdetachedattr(uint32_t inode,uint8_t attr[35]) {
+uint8_t fs_getdetachedattr(uint32_t inode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
 	uint32_t i;
@@ -2249,11 +2341,11 @@ uint8_t fs_getdetachedattr(uint32_t inode,uint8_t attr[35]) {
 		ret = LIZARDFS_ERROR_IO;
 	} else if (i==1) {
 		ret = rptr[0];
-	} else if (i!=35) {
+	} else if (i != attr.size()) {
 		setDisconnect(true);
 		ret = LIZARDFS_ERROR_IO;
 	} else {
-		memcpy(attr,rptr,35);
+		memcpy(attr.data(), rptr, attr.size());
 		ret = LIZARDFS_STATUS_OK;
 	}
 	return ret;
@@ -2830,4 +2922,3 @@ uint8_t fs_flock_recv() {
 		return LIZARDFS_ERROR_IO;
 	}
 }
-

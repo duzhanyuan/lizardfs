@@ -1,5 +1,5 @@
 /*
-   Copyright 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o.
+   Copyright 2013-2017 EditShare, 2013-2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -24,12 +24,25 @@
 
 #include "common/access_control_list.h"
 #include "common/acl_type.h"
+#include "common/legacy_acl.h"
 #include "common/moosefs_string.h"
 #include "common/serialization_macros.h"
+#include "common/small_vector.h"
 #include "protocol/lock_info.h"
 #include "protocol/MFSCommunication.h"
 #include "protocol/packet.h"
 #include "protocol/quota.h"
+
+namespace cltoma { namespace updateCredentials {
+enum DefaultGroupsSize {
+	kDefaultGroupsSize = 16
+};
+typedef small_vector<uint32_t, kDefaultGroupsSize> GroupsContainer;
+} } // cltoma::updateCredentials
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, updateCredentials, LIZ_CLTOMA_UPDATE_CREDENTIALS, 0,
+		uint32_t, messageId,
+		uint32_t, index,
+		GroupsContainer, gids)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseMknod, LIZ_CLTOMA_FUSE_MKNOD, 0,
 		uint32_t, messageId,
@@ -68,8 +81,18 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		uint32_t, gid,
 		AclType, type)
 
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, fuseSetAcl, kLegacyACL, 0)
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, fuseSetAcl, kCurrentACL, 1)
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, 0,
+		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, kLegacyACL,
+		uint32_t, messageId,
+		uint32_t, inode,
+		uint32_t, uid,
+		uint32_t, gid,
+		AclType, type,
+		legacy::AccessControlList, acl)
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, kCurrentACL,
 		uint32_t, messageId,
 		uint32_t, inode,
 		uint32_t, uid,
@@ -302,6 +325,62 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, manageLocksUnlock, LIZ_CLTOMA_MANAGE_LOCKS_UNLOCK, kInode,
 		lzfs_locks::Type, type,
 		uint32_t, inode)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, wholePathLookup, LIZ_CLTOMA_WHOLE_PATH_LOOKUP, 0,
+		uint32_t, messageId,
+		uint32_t, inode,
+		std::string, name,
+		uint32_t, uid,
+		uint32_t, gid)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, recursiveRemove, LIZ_CLTOMA_RECURSIVE_REMOVE, 0,
+		uint32_t, msgid,
+		uint32_t, jobId,
+		uint32_t, inode,
+		std::string, file_name,
+		uint32_t, uid,
+		uint32_t, gid)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetDir, LIZ_CLTOMA_FUSE_GETDIR, 0,
+		uint32_t, message_id,
+		uint32_t, inode,
+		uint32_t, uid,
+		uint32_t, gid,
+		uint64_t, first_entry,
+		uint64_t, number_of_entries)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, listTasks, LIZ_CLTOMA_LIST_TASKS, 0,
+		bool, dummy)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, stopTask, LIZ_CLTOMA_STOP_TASK, 0,
+		uint32_t, msgid,
+		uint32_t, taskid)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, requestTaskId, LIZ_CLTOMA_REQUEST_TASK_ID, 0,
+		uint32_t, msgid)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, snapshot, LIZ_CLTOMA_FUSE_SNAPSHOT, 0,
+		uint32_t, msgid,
+		uint32_t, jobid,
+		uint32_t, inode,
+		uint32_t, inode_dst,
+		std::string, name_dst,
+		uint32_t, uid,
+		uint32_t, gid,
+		uint8_t, canoverwrite,
+		uint8_t, ignore_missing_src,
+		uint32_t, initial_batch)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, listDefectiveFiles, LIZ_CLTOMA_LIST_DEFECTIVE_FILES, 0,
+		uint8_t, flags,
+		uint64_t, first_entry,
+		uint64_t, number_of_entries)
 
 namespace cltoma {
 

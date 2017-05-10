@@ -19,9 +19,12 @@
 #pragma once
 #include "common/platform.h"
 
+#include <cassert>
 #include <cstdint>
 
+#include "common/small_vector.h"
 #include "common/special_inode_defs.h"
+#include "protocol/cltoma.h"
 #include "protocol/MFSCommunication.h"
 #include "master/personality.h"
 
@@ -32,6 +35,8 @@
  */
 class FsContext {
 public:
+	typedef cltoma::updateCredentials::GroupsContainer GroupsContainer;
+
 	/**
 	 * Returns object suitable for use by metarestore or the shadow master.
 	 *
@@ -97,6 +102,50 @@ public:
 	}
 
 	/**
+	 * Returns object suitable for use by the master server.
+	 *
+	 * It contains full information: session data and and information
+	 * about the client needed to check permissions.
+	 *
+	 * \param ts - a timestamp of the operations made in this context
+	 * \param rootinode - inode of the mounted root directory (or 0 for meta-mount)
+	 * \param sesflags - session flags
+	 * \param uid - remapped uid of the user which will perform operations in this context
+	 * \param gids - vector with remapped secondary group ids.
+	 * \param auid - real uid of the user which will perform operations in this context
+	 * \param agid - real gid of the user which will perform operations in this context
+	 */
+	static FsContext getForMasterWithSession(uint32_t ts,
+			uint32_t rootinode, uint8_t sesflags,
+			uint32_t uid, GroupsContainer &&gids,
+			uint32_t auid, uint32_t agid) {
+		return FsContext(ts, metadataserver::Personality::kMaster,
+				rootinode, sesflags, uid, std::move(gids), auid, agid);
+	}
+
+	/**
+	 * Returns object suitable for use by the master server.
+	 *
+	 * It contains full information: session data and and information
+	 * about the client needed to check permissions.
+	 *
+	 * \param ts - a timestamp of the operations made in this context
+	 * \param rootinode - inode of the mounted root directory (or 0 for meta-mount)
+	 * \param sesflags - session flags
+	 * \param uid - remapped uid of the user which will perform operations in this context
+	 * \param gids - vector with remapped secondary group ids.
+	 * \param auid - real uid of the user which will perform operations in this context
+	 * \param agid - real gid of the user which will perform operations in this context
+	 */
+	static FsContext getForMasterWithSession(uint32_t ts,
+			uint32_t rootinode, uint8_t sesflags,
+			uint32_t uid, const GroupsContainer &gids,
+			uint32_t auid, uint32_t agid) {
+		return FsContext(ts, metadataserver::Personality::kMaster,
+				rootinode, sesflags, uid, std::move(gids), auid, agid);
+	}
+
+	/**
 	 * Returns true if we can check permissions in this context
 	 */
 	bool canCheckPermissions() const {
@@ -107,6 +156,7 @@ public:
 	 * Returns original (not remapped) gid.
 	 */
 	uint32_t agid() const {
+		assert(hasUidGidData_);
 		return agid_;
 	}
 
@@ -114,14 +164,35 @@ public:
 	 * Returns original (not remapped) uid.
 	 */
 	uint32_t auid() const {
+		assert(hasUidGidData_);
 		return auid_;
+	}
+
+	/**
+	 * Returns (remapped) uid.
+	 */
+	uint32_t uid() const {
+		assert(hasUidGidData_);
+		return uid_;
 	}
 
 	/**
 	 * Returns (remapped) gid.
 	 */
 	uint32_t gid() const {
-		return gid_;
+		assert(hasUidGidData_ && !gids_.empty());
+		return gids_[0];
+	}
+
+	/**
+	 * Returns (remapped) vector containing gid (first position) and secondary groups.
+	 */
+	const GroupsContainer &groups() const {
+		return gids_;
+	}
+
+	bool hasGroup(uint32_t gid) const {
+		return std::find(gids_.begin(), gids_.end(), gid) != gids_.end();
 	}
 
 	/**
@@ -165,6 +236,7 @@ public:
 	 * Returns 0 in case of meta session.
 	 */
 	uint32_t rootinode() const {
+		assert(hasSessionData_);
 		return rootinode_;
 	}
 
@@ -172,6 +244,7 @@ public:
 	 * Returns session flags.
 	 */
 	uint8_t sesflags() const {
+		assert(hasSessionData_);
 		return sesflags_;
 	}
 
@@ -183,13 +256,6 @@ public:
 		return ts_;
 	}
 
-	/**
-	 * Returns (remapped) uid.
-	 */
-	uint32_t uid() const {
-		return uid_;
-	}
-
 private:
 	uint32_t ts_;
 	metadataserver::Personality personality_;
@@ -197,7 +263,45 @@ private:
 	uint32_t rootinode_;
 	uint8_t sesflags_;
 	bool hasUidGidData_;
-	uint32_t uid_, gid_, auid_, agid_;
+	uint32_t uid_, auid_;
+	GroupsContainer gids_;
+	uint32_t agid_;
+
+	/**
+	 * Constructs object with session data and uid/gid data.
+	 */
+	FsContext(uint32_t ts, metadataserver::Personality personality,
+			uint32_t rootinode, uint8_t sesflags,
+			uint32_t uid, GroupsContainer &&gids, uint32_t auid, uint32_t agid)
+			: ts_(ts),
+			  personality_(personality),
+			  hasSessionData_(true),
+			  rootinode_(rootinode),
+			  sesflags_(sesflags),
+			  hasUidGidData_(true),
+			  uid_(uid),
+			  auid_(auid),
+			  gids_(std::move(gids)),
+			  agid_(agid) {
+	}
+
+	/**
+	 * Constructs object with session data and uid/gid data.
+	 */
+	FsContext(uint32_t ts, metadataserver::Personality personality,
+			uint32_t rootinode, uint8_t sesflags,
+			uint32_t uid, const GroupsContainer &gids, uint32_t auid, uint32_t agid)
+			: ts_(ts),
+			  personality_(personality),
+			  hasSessionData_(true),
+			  rootinode_(rootinode),
+			  sesflags_(sesflags),
+			  hasUidGidData_(true),
+			  uid_(uid),
+			  auid_(auid),
+			  gids_(gids),
+			  agid_(agid) {
+	}
 
 	/**
 	 * Constructs object with session data and uid/gid data.
@@ -212,8 +316,8 @@ private:
 			  sesflags_(sesflags),
 			  hasUidGidData_(true),
 			  uid_(uid),
-			  gid_(gid),
 			  auid_(auid),
+			  gids_(1, gid),
 			  agid_(agid) {
 	}
 
@@ -228,8 +332,8 @@ private:
 			  sesflags_(sesflags),
 			  hasUidGidData_(false),
 			  uid_(0),
-			  gid_(0),
 			  auid_(0),
+			  gids_(),
 			  agid_(0) {
 	}
 
@@ -244,8 +348,8 @@ private:
 			  sesflags_(0),
 			  hasUidGidData_(false),
 			  uid_(0),
-			  gid_(0),
 			  auid_(0),
+			  gids_(),
 			  agid_(0) {
 	}
 
@@ -261,8 +365,8 @@ private:
 			  sesflags_(0),
 			  hasUidGidData_(true),
 			  uid_(uid),
-			  gid_(gid),
 			  auid_(auid),
+			  gids_(1, gid),
 			  agid_(agid) {
 	}
 };

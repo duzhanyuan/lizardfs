@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o..
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
 
@@ -42,6 +42,9 @@
 #include "protocol/quota.h"
 
 LIZARDFS_CREATE_EXCEPTION_CLASS_MSG(NoMetadataException, Exception, "no metadata");
+
+uint8_t fs_cancel_job(uint32_t job_id);
+uint32_t fs_reserve_job_id();
 
 /// Returns version of the loaded metadata.
 uint64_t fs_getversion();
@@ -109,6 +112,41 @@ uint8_t fs_writechunk(const FsContext& context, uint32_t inode, uint32_t indx,
 		bool usedummylockid, /* inout */ uint32_t *lockid,
 		uint64_t *chunkid, uint8_t *opflag, uint64_t *length, uint32_t min_server_version = 0);
 uint8_t fs_set_nextchunkid(const FsContext& context, uint64_t nextChunkId);
+uint8_t fs_access(const FsContext& context,uint32_t inode,int modemask);
+uint8_t fs_lookup(const FsContext &context, uint32_t parent, const HString &name, uint32_t *inode, Attributes &attr);
+uint8_t fs_whole_path_lookup(const FsContext &context, uint32_t parent, const std::string &path, uint32_t *found_inode, Attributes &attr);
+uint8_t fs_getattr(const FsContext &context, uint32_t inode, Attributes &attr);
+uint8_t fs_try_setlength(const FsContext &context, uint32_t inode, uint8_t opened, uint64_t length,
+						 bool denyTruncatingParity,uint32_t lockid,Attributes& attr,uint64_t *chunkid);
+uint8_t fs_do_setlength(const FsContext &context,uint32_t inode,uint64_t length,Attributes& attr);
+uint8_t fs_setattr(const FsContext &context,uint32_t inode,uint8_t setmask,uint16_t attrmode,uint32_t attruid,uint32_t attrgid,uint32_t attratime,uint32_t attrmtime,SugidClearMode sugidclearmode,Attributes& attr);
+uint8_t fs_readlink(const FsContext &context,uint32_t inode,std::string &path);
+void fs_statfs(const FsContext &context,uint64_t *totalspace,uint64_t *availspace,uint64_t *trashspace,uint64_t *reservedspace,uint32_t *inodes);
+uint8_t fs_mknod(const FsContext &context,uint32_t parent,const HString &name,uint8_t type,uint16_t mode,uint16_t umask,uint32_t rdev,uint32_t *inode,Attributes& attr);
+uint8_t fs_mkdir(const FsContext &context,uint32_t parent,const HString &name,uint16_t mode,uint16_t umask,uint8_t copysgid,uint32_t *inode,Attributes& attr);
+uint8_t fs_repair(const FsContext &context,uint32_t inode,uint8_t correct_only,uint32_t *notchanged,uint32_t *erased,uint32_t *repaired);
+uint8_t fs_rmdir(const FsContext &context,uint32_t parent,const HString &name);
+uint8_t fs_recursive_remove(const FsContext &context, uint32_t parent, const HString &name, const std::function<void(int)> &callback, uint32_t job_id = fs_reserve_job_id());
+uint8_t fs_readdir_size(const FsContext &context,uint32_t inode,uint8_t flags,void **dnode,uint32_t *dbuffsize);
+void fs_readdir_data(const FsContext &context,uint8_t flags,void *dnode,uint8_t *dbuff);
+uint8_t fs_readdir(const FsContext &context, uint32_t inode, uint64_t first_entry, uint64_t number_of_entries,
+		std::vector<DirectoryEntry> &dir_entries);
+uint8_t fs_checkfile(const FsContext &context,uint32_t inode,uint32_t chunkcount[CHUNK_MATRIX_SIZE]);
+uint8_t fs_opencheck(const FsContext &context,uint32_t inode,uint8_t flags,Attributes& attr);
+uint8_t fs_getgoal(const FsContext &context,uint32_t inode,uint8_t gmode,GoalStatistics &fgtab, GoalStatistics &dgtab);
+uint8_t fs_gettrashtime_prepare(const FsContext &context, uint32_t inode, uint8_t gmode, TrashtimeMap &fileTrashtimes, TrashtimeMap &dirTrashtimes);
+uint8_t fs_geteattr(const FsContext &context,uint32_t inode,uint8_t gmode,uint32_t feattrtab[16],uint32_t deattrtab[16]);
+uint8_t fs_listxattr_leng(const FsContext &context,uint32_t inode,uint8_t opened,void **xanode,uint32_t *xasize);
+uint8_t fs_getxattr(const FsContext &context,uint32_t inode,uint8_t opened,uint8_t anleng,const uint8_t *attrname,uint32_t *avleng,uint8_t **attrvalue);
+uint8_t fs_setxattr(const FsContext &context,uint32_t inode,uint8_t opened,uint8_t anleng,const uint8_t *attrname,uint32_t avleng,const uint8_t *attrvalue,uint8_t mode);
+uint8_t fs_quota_get_all(const FsContext &context, std::vector<QuotaEntry> &results);
+uint8_t fs_quota_get(const FsContext &context, const std::vector<QuotaOwner> &owners,
+					 std::vector<QuotaEntry> &results);
+uint8_t fs_unlink(const FsContext &context,uint32_t parent,const HString &name);
+uint8_t fs_getacl(const FsContext& context, uint32_t inode, AclType type, AccessControlList& acl);
+uint8_t fs_quota_set(const FsContext &context, const std::vector<QuotaEntry>& entries);
+uint8_t fs_quota_get_info(const FsContext &context, const std::vector<QuotaEntry> &entries,
+		std::vector<std::string> &result);
 
 // Functions which apply changes from changelog, only for shadow master and metarestore
 uint8_t fs_apply_checksum(const std::string& version, uint64_t checksum);
@@ -155,48 +193,14 @@ void fs_disable_checksum_verification(bool value);
 // Functions which modify metadata or return some information.
 // To be used by the master server with personality == kMaster
 void fs_info(uint64_t *totalspace,uint64_t *availspace,uint64_t *trspace,uint32_t *trnodes,uint64_t *respace,uint32_t *renodes,uint32_t *inodes,uint32_t *dnodes,uint32_t *fnodes);
-void fs_test_getdata(uint32_t *loopstart,uint32_t *loopend,uint32_t *files,uint32_t *ugfiles,uint32_t *mfiles,uint32_t *chunks,uint32_t *ugchunks,uint32_t *mchunks,char **msgbuff,uint32_t *msgbuffleng);
 uint32_t fs_getdirpath_size(uint32_t inode);
 void fs_getdirpath_data(uint32_t inode,uint8_t *buff,uint32_t size);
 uint8_t fs_getrootinode(uint32_t *rootinode,const uint8_t *path);
-void fs_statfs(uint32_t rootinode,uint8_t sesflags,uint64_t *totalspace,uint64_t *availspace,uint64_t *trashspace,uint64_t *reservedspace,uint32_t *inodes);
-uint8_t fs_access(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,int modemask);
-uint8_t fs_lookup(uint32_t rootinode,uint8_t sesflags,uint32_t parent,const HString &name,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint32_t *inode,Attributes& attr);
-uint8_t fs_getattr(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,Attributes& attr);
-uint8_t fs_setattr(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint8_t setmask,uint16_t attrmode,uint32_t attruid,uint32_t attrgid,uint32_t attratime,uint32_t attrmtime,SugidClearMode sugidclearmode,Attributes& attr);
-uint8_t fs_try_setlength(uint32_t rootinode,uint8_t sesflags,
-		uint32_t inode,uint8_t opened,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,
-		uint64_t length,bool denyTruncatingParity,uint32_t lockid,Attributes& attr,uint64_t *chunkid);
 uint8_t fs_end_setlength(uint64_t chunkid);
-uint8_t fs_do_setlength(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint64_t length,Attributes& attr);
-uint8_t fs_readlink(uint32_t rootinode,uint8_t sesflags,uint32_t inode,std::string &path);
-uint8_t fs_mknod(uint32_t rootinode,uint8_t sesflags,uint32_t parent,const HString &name,uint8_t type,uint16_t mode,uint16_t umask,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint32_t rdev,uint32_t *inode,Attributes& attr);
-uint8_t fs_mkdir(uint32_t rootinode,uint8_t sesflags,uint32_t parent,const HString &name,uint16_t mode,uint16_t umask,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint8_t copysgid,uint32_t *inode,Attributes& attr);
-uint8_t fs_repair(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,uint8_t correct_only,uint32_t *notchanged,uint32_t *erased,uint32_t *repaired);
-uint8_t fs_rmdir(uint32_t rootinode,uint8_t sesflags,uint32_t parent,const HString &name,uint32_t uid,uint32_t gid);
-uint8_t fs_readdir_size(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,uint8_t flags,void **dnode,uint32_t *dbuffsize);
-void fs_readdir_data(uint32_t rootinode,uint8_t sesflags,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint8_t flags,void *dnode,uint8_t *dbuff);
-uint8_t fs_checkfile(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t chunkcount[CHUNK_MATRIX_SIZE]);
-uint8_t fs_opencheck(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t uid,uint32_t gid,uint32_t auid,uint32_t agid,uint8_t flags,Attributes& attr);
 uint8_t fs_readchunk(uint32_t inode,uint32_t indx,uint64_t *chunkid,uint64_t *length);
 uint8_t fs_writeend(uint32_t inode,uint64_t length,uint64_t chunkid, uint32_t lockid);
-uint8_t fs_getgoal(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint8_t gmode,GoalStatistics &fgtab, GoalStatistics &dgtab);
-uint8_t fs_gettrashtime_prepare(uint32_t rootinode, uint8_t sesflags, uint32_t inode, uint8_t gmode, TrashtimeMap &fileTrashtimes, TrashtimeMap &dirTrashtimes);
 void fs_gettrashtime_store(TrashtimeMap &fileTrashtimes, TrashtimeMap &dirTrashtimes,uint8_t *buff);
-uint8_t fs_geteattr(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint8_t gmode,uint32_t feattrtab[16],uint32_t deattrtab[16]);
-uint8_t fs_listxattr_leng(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint8_t opened,uint32_t uid,uint32_t gid,void **xanode,uint32_t *xasize);
 void fs_listxattr_data(void *xanode,uint8_t *xabuff);
-uint8_t fs_getxattr(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint8_t opened,uint32_t uid,uint32_t gid,uint8_t anleng,const uint8_t *attrname,uint32_t *avleng,uint8_t **attrvalue);
-uint8_t fs_setxattr(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint8_t opened,uint32_t uid,uint32_t gid,uint8_t anleng,const uint8_t *attrname,uint32_t avleng,const uint8_t *attrvalue,uint8_t mode);
-uint8_t fs_unlink(uint32_t rootinode,uint8_t sesflags,uint32_t parent,const HString &name,uint32_t uid,uint32_t gid);
-uint8_t fs_getacl(const FsContext& context, uint32_t inode, AclType type, AccessControlList& acl);
-uint8_t fs_quota_get_all(uint8_t sesflags, uint32_t root_inode, uint32_t uid,
-		std::vector<QuotaEntry> &results);
-uint8_t fs_quota_get(uint8_t sesflags, uint32_t root_inode, uint32_t uid, uint32_t gid,
-		const std::vector<QuotaOwner> &owners, std::vector<QuotaEntry> &results);
-uint8_t fs_quota_set(uint8_t seslfags, uint32_t uid, const std::vector<QuotaEntry>& entries);
-uint8_t fs_quota_get_info(uint32_t root_inode, const std::vector<QuotaEntry> &entries,
-		std::vector<std::string> &result);
 
 uint32_t fs_newsessionid(void);
 
@@ -213,7 +217,7 @@ uint8_t fs_gettrashpath(uint32_t rootinode,uint8_t sesflags,uint32_t inode,std::
 uint8_t fs_getdetachedattr(uint32_t rootinode,uint8_t sesflags,uint32_t inode,Attributes& attr,uint8_t dtype);
 
 // EXTRA
-uint8_t fs_get_dir_stats(uint32_t rootinode,uint8_t sesflags,uint32_t inode,uint32_t *inodes,uint32_t *dirs,uint32_t *files,uint32_t *chunks,uint64_t *length,uint64_t *size,uint64_t *rsize);
+uint8_t fs_get_dir_stats(const FsContext &context,uint32_t inode,uint32_t *inodes,uint32_t *dirs,uint32_t *files,uint32_t *chunks,uint64_t *length,uint64_t *size,uint64_t *rsize);
 uint8_t fs_get_chunkid(const FsContext& context,
 		uint32_t inode, uint32_t index, uint64_t *chunkid);
 
@@ -236,6 +240,8 @@ const std::map<int, Goal>& fs_get_goal_definitions();
 /// Return the current definition of the given (by ID) goal.
 const Goal& fs_get_goal_definition(uint8_t goalId);
 
+/// Return info about currently executed tasks
+std::vector<JobInfo> fs_get_current_tasks_info();
 // Disable saving metadata on exit
 void fs_disable_metadata_dump_on_exit();
 

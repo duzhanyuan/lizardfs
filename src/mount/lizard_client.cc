@@ -40,7 +40,6 @@
 #include "common/datapack.h"
 #include "common/lru_cache.h"
 #include "common/mfserr.h"
-#include "common/posix_acl_xattr.h"
 #include "common/slogger.h"
 #include "common/special_inode_defs.h"
 #include "common/time_utils.h"
@@ -48,7 +47,7 @@
 #include "mount/acl_cache.h"
 #include "mount/chunk_locator.h"
 #include "mount/client_common.h"
-#include "mount/dirattrcache.h"
+#include "mount/direntry_cache.h"
 #include "mount/errno_defs.h"
 #include "mount/g_io_limiters.h"
 #include "mount/io_limit_group.h"
@@ -62,6 +61,7 @@
 #include "mount/tweaks.h"
 #include "mount/writedata.h"
 #include "protocol/MFSCommunication.h"
+#include "protocol/matocl.h"
 
 #include "mount/stat_defs.h" // !!! This must be last include. Do not move !!!
 
@@ -85,6 +85,42 @@ namespace LizardClient {
 		|| strcmp(SPECIAL_FILE_NAME_OPHISTORY,(name))==0 || strcmp(SPECIAL_FILE_NAME_TWEAKS,(name))==0 \
 		|| strcmp(SPECIAL_FILE_NAME_FILE_BY_INODE,(name))==0))
 
+static GroupCache gGroupCache;
+
+#define RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, group_id, function_expression) \
+		do { \
+			const uint32_t kSecondaryGroupsBit = (uint32_t)1 << 31; \
+			status = function_expression; \
+			if (status == LIZARDFS_ERROR_GROUPNOTREGISTERED) { \
+				uint32_t index = group_id ^ kSecondaryGroupsBit; \
+				GroupCache::Groups groups = gGroupCache.findByIndex(index); \
+				if (!groups.empty()) { \
+					update_credentials(index, groups); \
+					status = function_expression; \
+				} \
+			} \
+		} while (0);
+
+int updateGroups(const GroupCache::Groups &groups) {
+	static const uint32_t kSecondaryGroupsBit = (uint32_t)1 << 31;
+
+	auto result = gGroupCache.find(groups);
+	uint32_t gid = 0;
+	uint32_t index;
+	if (result.found == false) {
+		try {
+			index = gGroupCache.put(groups);
+			LizardClient::update_credentials(index, groups);
+			gid = index | kSecondaryGroupsBit;
+		} catch (LizardClient::RequestException &e) {
+			lzfs_pretty_syslog(LOG_ERR, "Cannot update groups: %d", e.errNo);
+		}
+	} else {
+		gid = result.index | kSecondaryGroupsBit;
+	}
+	return gid;
+}
+
 Inode getSpecialInodeByName(const char *name) {
 	if (strcmp(name, SPECIAL_FILE_NAME_MASTERINFO) == 0) {
 		return SPECIAL_INODE_MASTERINFO;
@@ -107,17 +143,6 @@ bool isSpecialInode(Inode ino) {
 	return IS_SPECIAL_INODE(ino);
 }
 
-typedef struct _dirbuf {
-	int wasread;
-	int dataformat;
-	uid_t uid;
-	gid_t gid;
-	const uint8_t *p;
-	size_t size;
-	void *dcache;
-	pthread_mutex_t lock;
-} dirbuf;
-
 enum {IO_NONE,IO_READ,IO_WRITE,IO_READONLY,IO_WRITEONLY};
 
 typedef struct _finfo {
@@ -128,6 +153,9 @@ typedef struct _finfo {
 	pthread_mutex_t lock;
 	pthread_mutex_t flushlock;
 } finfo;
+
+static DirEntryCache gDirEntryCache;
+static unsigned gDirEntryCacheMaxSize = 100000;
 
 static int debug_mode = 0;
 static int usedircache = 1;
@@ -287,17 +315,17 @@ void type_to_stat(uint32_t inode,uint8_t type, struct stat *stbuf) {
 	}
 }
 
-uint8_t attr_get_mattr(const uint8_t attr[35]) {
+uint8_t attr_get_mattr(const Attributes &attr) {
 	return (attr[1]>>4);    // higher 4 bits of mode
 }
 
-void attr_to_stat(uint32_t inode, const uint8_t attr[35], struct stat *stbuf) {
+void attr_to_stat(uint32_t inode, const Attributes &attr, struct stat *stbuf) {
 	uint16_t attrmode;
 	uint8_t attrtype;
 	uint32_t attruid,attrgid,attratime,attrmtime,attrctime,attrnlink,attrrdev;
 	uint64_t attrlength;
 	const uint8_t *ptr;
-	ptr = attr;
+	ptr = attr.data();
 	attrtype = get8bit(&ptr);
 	attrmode = get16bit(&ptr);
 	attruid = get32bit(&ptr);
@@ -541,19 +569,20 @@ void access(Context ctx, Inode ino, int mask) {
 		}
 		return;
 	}
-	status = fs_access(ino,ctx.uid,ctx.gid,mmode);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_access(ino,ctx.uid,ctx.gid,mmode));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		throw RequestException(status);
 	}
 }
 
-EntryParam lookup(Context ctx, Inode parent, const char *name) {
+EntryParam lookup(Context ctx, Inode parent, const char *name, bool whole_path_lookup) {
 	EntryParam e;
 	uint64_t maxfleng;
 	uint32_t inode;
 	uint32_t nleng;
-	uint8_t attr[35];
+	Attributes attr;
 	char attrstr[256];
 	uint8_t mattr;
 	uint8_t icacheflag;
@@ -590,10 +619,11 @@ EntryParam lookup(Context ctx, Inode parent, const char *name) {
 		if (endptr == nullptr || *endptr != '\0') {
 			throw RequestException(EINVAL);
 		}
-		status = fs_getattr(inode, ctx.uid, ctx.gid, attr);
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_getattr(inode, ctx.uid, ctx.gid, attr));
 		status = errorconv_dbg(status);
 		icacheflag = 0;
-	} else if (usedircache && dcache_lookup(&ctx,parent,nleng,(const uint8_t*)name,&inode,attr)) {
+	} else if (usedircache && gDirEntryCache.lookup(ctx,parent,std::string(name,nleng),inode,attr)) {
 		if (debug_mode) {
 			fprintf(stderr,"lookup: sending data from dircache\n");
 		}
@@ -603,7 +633,13 @@ EntryParam lookup(Context ctx, Inode parent, const char *name) {
 //              oplog_printf(ctx, "lookup (%lu,%s) (using open dir cache): OK (%lu)",(unsigned long int)parent,name,(unsigned long int)inode);
 	} else {
 		stats_inc(OP_LOOKUP);
-		status = fs_lookup(parent,nleng,(const uint8_t*)name,ctx.uid,ctx.gid,&inode,attr);
+		if (whole_path_lookup) {
+			RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_whole_path_lookup(parent, std::string(name, nleng), ctx.uid, ctx.gid, &inode, attr));
+		} else {
+			RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_lookup(parent,nleng,(const uint8_t*)name,ctx.uid,ctx.gid,&inode,attr));
+		}
 		status = errorconv_dbg(status);
 		icacheflag = 0;
 	}
@@ -643,7 +679,7 @@ AttrReply getattr(Context ctx, Inode ino, FileInfo *fi) {
 	uint64_t maxfleng;
 	double attr_timeout;
 	struct stat o_stbuf;
-	uint8_t attr[35];
+	Attributes attr;
 	char attrstr[256];
 	int status;
 	(void)fi;
@@ -659,7 +695,7 @@ AttrReply getattr(Context ctx, Inode ino, FileInfo *fi) {
 	}
 
 	maxfleng = write_data_getmaxfleng(ino);
-	if (usedircache && dcache_getattr(&ctx,ino,attr)) {
+	if (usedircache && gDirEntryCache.lookup(ctx,ino,attr)) {
 		if (debug_mode) {
 			fprintf(stderr,"getattr: sending data from dircache\n");
 		}
@@ -667,7 +703,8 @@ AttrReply getattr(Context ctx, Inode ino, FileInfo *fi) {
 		status = 0;
 	} else {
 		stats_inc(OP_GETATTR);
-		status = fs_getattr(ino,ctx.uid,ctx.gid,attr);
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_getattr(ino,ctx.uid,ctx.gid,attr));
 		status = errorconv_dbg(status);
 	}
 	if (status!=0) {
@@ -694,7 +731,7 @@ AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf,
 	          int to_set, FileInfo *fi) {
 	struct stat o_stbuf;
 	uint64_t maxfleng;
-	uint8_t attr[35];
+	Attributes attr;
 	char modestr[11];
 	char attrstr[256];
 	double attr_timeout;
@@ -739,7 +776,8 @@ AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf,
 			| LIZARDFS_SET_ATTR_MTIME
 			| LIZARDFS_SET_ATTR_MTIME_NOW
 			| LIZARDFS_SET_ATTR_SIZE)) == 0) { // change other flags or change nothing
-		status = fs_setattr(ino,ctx.uid,ctx.gid,0,0,0,0,0,0,0,attr);    // ext3 compatibility - change ctime during this operation (usually chown(-1,-1))
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_setattr(ino,ctx.uid,ctx.gid,0,0,0,0,0,0,0,attr));    // ext3 compatibility - change ctime during this operation (usually chown(-1,-1))
 		status = errorconv_dbg(status);
 		if (status!=0) {
 			oplog_printf(ctx, "setattr (%lu,0x%X,[%s:0%04o,%ld,%ld,%lu,%lu,%" PRIu64 "]): %s",
@@ -789,7 +827,8 @@ AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf,
 			// in this case we want flush all pending writes because they could overwrite mtime
 			write_data_flush_inode(ino);
 		}
-		status = fs_setattr(ino,ctx.uid,ctx.gid,setmask,stbuf->st_mode&07777,stbuf->st_uid,stbuf->st_gid,stbuf->st_atime,stbuf->st_mtime,sugid_clear_mode,attr);
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_setattr(ino,ctx.uid,ctx.gid,setmask,stbuf->st_mode&07777,stbuf->st_uid,stbuf->st_gid,stbuf->st_atime,stbuf->st_mtime,sugid_clear_mode,attr));
 		if (to_set & (LIZARDFS_SET_ATTR_MODE | LIZARDFS_SET_ATTR_UID | LIZARDFS_SET_ATTR_GID)) {
 			eraseAclCache(ino);
 		}
@@ -840,7 +879,8 @@ AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf,
 		}
 		try {
 			bool opened = (fi != NULL);
-			status = write_data_truncate(ino, opened, ctx.uid, ctx.gid, stbuf->st_size, attr);
+			RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+				write_data_truncate(ino, opened, ctx.uid, ctx.gid, stbuf->st_size, attr));
 			maxfleng = 0; // after the flush master server has valid length, don't use our length cache
 		} catch (Exception& ex) {
 			status = errorconv_dbg(ex.status());
@@ -875,6 +915,7 @@ AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf,
 				strerr(status));
 		throw RequestException(status);
 	}
+	gDirEntryCache.lockAndInvalidateInode(ino);
 	memset(&o_stbuf, 0, sizeof(struct stat));
 	attr_to_stat(ino,attr,&o_stbuf);
 	if (attr[0]==TYPE_FILE && maxfleng>(uint64_t)(o_stbuf.st_size)) {
@@ -900,7 +941,7 @@ AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf,
 EntryParam mknod(Context ctx, Inode parent, const char *name, mode_t mode, dev_t rdev) {
 	EntryParam e;
 	uint32_t inode;
-	uint8_t attr[35];
+	Attributes attr;
 	char modestr[11];
 	char attrstr[256];
 	uint8_t mattr;
@@ -968,8 +1009,8 @@ EntryParam mknod(Context ctx, Inode parent, const char *name, mode_t mode, dev_t
 			throw RequestException(EACCES);
 		}
 	}
-
-	status = fs_mknod(parent,nleng,(const uint8_t*)name,type,mode&07777,ctx.umask,ctx.uid,ctx.gid,rdev,inode,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_mknod(parent,nleng,(const uint8_t*)name,type,mode&07777,ctx.umask,ctx.uid,ctx.gid,rdev,inode,attr));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "mknod (%lu,%s,%s:0%04o,0x%08lX): %s",
@@ -1031,8 +1072,9 @@ void unlink(Context ctx, Inode parent, const char *name) {
 		throw RequestException(ENAMETOOLONG);
 	}
 
-	status = fs_unlink(parent,nleng,(const uint8_t*)name,ctx.uid,ctx.gid);
-	dcache_invalidate(parent);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_unlink(parent,nleng,(const uint8_t*)name,ctx.uid,ctx.gid));
+	gDirEntryCache.lockAndInvalidateParent(parent);
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "unlink (%lu,%s): %s",
@@ -1051,7 +1093,7 @@ void unlink(Context ctx, Inode parent, const char *name) {
 EntryParam mkdir(Context ctx, Inode parent, const char *name, mode_t mode) {
 	struct EntryParam e;
 	uint32_t inode;
-	uint8_t attr[35];
+	Attributes attr;
 	char modestr[11];
 	char attrstr[256];
 	uint8_t mattr;
@@ -1094,7 +1136,8 @@ EntryParam mkdir(Context ctx, Inode parent, const char *name, mode_t mode) {
 		throw RequestException(ENAMETOOLONG);
 	}
 
-	status = fs_mkdir(parent,nleng,(const uint8_t*)name,mode,ctx.umask,ctx.uid,ctx.gid,mkdir_copy_sgid,inode,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_mkdir(parent,nleng,(const uint8_t*)name,mode,ctx.umask,ctx.uid,ctx.gid,mkdir_copy_sgid,inode,attr));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "mkdir (%lu,%s,d%s:0%04o): %s",
@@ -1153,8 +1196,9 @@ void rmdir(Context ctx, Inode parent, const char *name) {
 		throw RequestException(ENAMETOOLONG);
 	}
 
-	status = fs_rmdir(parent,nleng,(const uint8_t*)name,ctx.uid,ctx.gid);
-	dcache_invalidate(parent);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_rmdir(parent,nleng,(const uint8_t*)name,ctx.uid,ctx.gid));
+	gDirEntryCache.lockAndInvalidateParent(parent);
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "rmdir (%lu,%s): %s",
@@ -1174,7 +1218,7 @@ EntryParam symlink(Context ctx, const char *path, Inode parent,
 			 const char *name) {
 	struct EntryParam e;
 	uint32_t inode;
-	uint8_t attr[35];
+	Attributes attr;
 	char attrstr[256];
 	uint8_t mattr;
 	uint32_t nleng;
@@ -1208,7 +1252,8 @@ EntryParam symlink(Context ctx, const char *path, Inode parent,
 		throw RequestException(ENAMETOOLONG);
 	}
 
-	status = fs_symlink(parent,nleng,(const uint8_t*)name,(const uint8_t*)path,ctx.uid,ctx.gid,&inode,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_symlink(parent,nleng,(const uint8_t*)name,(const uint8_t*)path,ctx.uid,ctx.gid,&inode,attr));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "symlink (%s,%lu,%s): %s",
@@ -1275,7 +1320,7 @@ void rename(Context ctx, Inode parent, const char *name,
 	uint32_t nleng,newnleng;
 	int status;
 	uint32_t inode;
-	uint8_t attr[35];
+	Attributes attr;
 
 	stats_inc(OP_RENAME);
 	if (debug_mode) {
@@ -1333,10 +1378,11 @@ void rename(Context ctx, Inode parent, const char *name,
 		throw RequestException(ENAMETOOLONG);
 	}
 
-	status = fs_rename(parent,nleng,(const uint8_t*)name,newparent,newnleng,(const uint8_t*)newname,ctx.uid,ctx.gid,&inode,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+	fs_rename(parent,nleng,(const uint8_t*)name,newparent,newnleng,(const uint8_t*)newname,ctx.uid,ctx.gid,&inode,attr));
 	status = errorconv_dbg(status);
-	dcache_invalidate(parent);
-	dcache_invalidate(newparent);
+	gDirEntryCache.lockAndInvalidateParent(parent);
+	gDirEntryCache.lockAndInvalidateParent(newparent);
 	if (status!=0) {
 		oplog_printf(ctx, "rename (%lu,%s,%lu,%s): %s",
 				(unsigned long int)parent,
@@ -1360,7 +1406,7 @@ EntryParam link(Context ctx, Inode ino, Inode newparent, const char *newname) {
 	int status;
 	EntryParam e;
 	uint32_t inode;
-	uint8_t attr[35];
+	Attributes attr;
 	char attrstr[256];
 	uint8_t mattr;
 
@@ -1404,7 +1450,8 @@ EntryParam link(Context ctx, Inode ino, Inode newparent, const char *newname) {
 		throw RequestException(ENAMETOOLONG);
 	}
 
-	status = fs_link(ino,newparent,newnleng,(const uint8_t*)newname,ctx.uid,ctx.gid,&inode,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_link(ino,newparent,newnleng,(const uint8_t*)newname,ctx.uid,ctx.gid,&inode,attr));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "link (%lu,%lu,%s): %s",
@@ -1433,8 +1480,9 @@ EntryParam link(Context ctx, Inode ino, Inode newparent, const char *newname) {
 }
 
 void opendir(Context ctx, Inode ino, FileInfo *fi) {
-	dirbuf *dirinfo;
 	int status;
+
+	fi->fh = 0;
 
 	stats_inc(OP_OPENDIR);
 	if (debug_mode) {
@@ -1448,162 +1496,119 @@ void opendir(Context ctx, Inode ino, FileInfo *fi) {
 				strerr(ENOTDIR));
 		throw RequestException(ENOTDIR);
 	}
-	status = fs_access(ino,ctx.uid,ctx.gid,MODE_MASK_R);    // at least test rights
+
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_access(ino,ctx.uid,ctx.gid,MODE_MASK_R));    // at least test rights
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "opendir (%lu): %s",
 				(unsigned long int)ino,
 				strerr(status));
 		throw RequestException(status);
-	} else {
-		dirinfo = (dirbuf*) malloc(sizeof(dirbuf));
-		pthread_mutex_init(&(dirinfo->lock),NULL);
-		PthreadMutexWrapper lock((dirinfo->lock));   // make valgrind happy
-		dirinfo->p = NULL;
-		dirinfo->size = 0;
-		dirinfo->dcache = NULL;
-		dirinfo->wasread = 0;
-		fi->fh = reinterpret_cast<uintptr_t>(dirinfo);
-		oplog_printf(ctx, "opendir (%lu): OK",
-				(unsigned long int)ino);
 	}
 }
 
-std::vector<DirEntry> readdir(Context ctx, Inode ino, off_t off, size_t maxEntries, FileInfo *fi) {
-	int status;
-	dirbuf *dirinfo = reinterpret_cast<dirbuf *>(fi->fh);
-	char name[MFS_NAME_MAX+1];
-	const uint8_t *ptr,*eptr;
-	uint8_t nleng;
-	uint32_t inode;
-	uint8_t type;
-	struct stat stbuf;
+std::vector<DirEntry> readdir(Context ctx, Inode ino, off_t off, size_t max_entries, FileInfo */*fi*/) {
+	static constexpr int kBatchSize = 1000;
 
 	stats_inc(OP_READDIR);
 	if (debug_mode) {
 		oplog_printf(ctx, "readdir (%lu,%" PRIu64 ",%" PRIu64 ") ...",
 				(unsigned long int)ino,
-				(uint64_t)maxEntries,
+				(uint64_t)max_entries,
 				(uint64_t)off);
 		fprintf(stderr,"readdir (%lu,%" PRIu64 ",%" PRIu64 ")\n",
 				(unsigned long int)ino,
-				(uint64_t)maxEntries,
+				(uint64_t)max_entries,
 				(uint64_t)off);
 	}
 	if (off<0) {
 		oplog_printf(ctx, "readdir (%lu,%" PRIu64 ",%" PRIu64 "): %s",
 				(unsigned long int)ino,
-				(uint64_t)maxEntries,
+				(uint64_t)max_entries,
 				(uint64_t)off,
 				strerr(EINVAL));
 		throw RequestException(EINVAL);
 	}
-	PthreadMutexWrapper lock((dirinfo->lock));
-	if (dirinfo->wasread==0 || (dirinfo->wasread==1 && off==0)) {
-		const uint8_t *dbuff;
-		uint32_t dsize;
-		uint8_t needscopy;
-		if (usedircache) {
-			status = fs_getdir_plus(ino,ctx.uid,ctx.gid,0,&dbuff,&dsize);
-			if (status==0) {
-				stats_inc(OP_GETDIR_FULL);
-			}
-			needscopy = 1;
-			dirinfo->dataformat = 1;
-		} else {
-			status = fs_getdir(ino,ctx.uid,ctx.gid,&dbuff,&dsize);
-			if (status==0) {
-				stats_inc(OP_GETDIR_SMALL);
-			}
-			needscopy = 1;
-			dirinfo->dataformat = 0;
+
+	std::vector<DirEntry> result;
+	shared_lock<shared_mutex> access_guard(gDirEntryCache.rwlock());
+	gDirEntryCache.updateTime();
+
+	uint64_t entry_index = off;
+	auto it = gDirEntryCache.find(ctx, ino, entry_index);
+
+	result.reserve(max_entries);
+	for(;it != gDirEntryCache.index_end() && max_entries > 0;++it) {
+		if (!gDirEntryCache.isValid(it) || it->index != entry_index) {
+			break;
 		}
-		status = errorconv_dbg(status);
-		if (status!=0) {
-			oplog_printf(ctx, "readdir (%lu,%" PRIu64 ",%" PRIu64 "): %s",
-					(unsigned long int)ino,
-					(uint64_t)maxEntries,
-					(uint64_t)off,
-					strerr(status));
-			throw RequestException(status);
+
+		if (it->inode == 0) {
+			// we have valid 'no more entries' marker
+			assert(it->name.empty());
+			max_entries = 0;
+			break;
 		}
-		if (dirinfo->dcache) {
-			dcache_release(dirinfo->dcache);
-			dirinfo->dcache = NULL;
-		}
-		if (dirinfo->p) {
-			free((uint8_t*)(dirinfo->p));
-			dirinfo->p = NULL;
-		}
-		if (needscopy) {
-			dirinfo->p = (const uint8_t*) malloc(dsize);
-			if (dirinfo->p == NULL) {
-				oplog_printf(ctx, "readdir (%lu,%" PRIu64 ",%" PRIu64 "): %s",
-						(unsigned long int)ino,
-						(uint64_t)maxEntries,
-						(uint64_t)off,
-						strerr(EINVAL));
-				throw RequestException(EINVAL);
-			}
-			memcpy((uint8_t*)(dirinfo->p),dbuff,dsize);
-		} else {
-			dirinfo->p = dbuff;
-		}
-		dirinfo->size = dsize;
-		if (usedircache && dirinfo->dataformat==1) {
-			dirinfo->dcache = dcache_new(&ctx,ino,dirinfo->p,dirinfo->size);
-		}
+
+		++entry_index;
+		--max_entries;
+
+		struct stat stats;
+		attr_to_stat(it->inode,it->attr,&stats);
+		result.emplace_back(it->name, stats, entry_index);
 	}
-	dirinfo->wasread=1;
 
-	std::vector<DirEntry> ret;
-	if (off>=(off_t)(dirinfo->size)) {
-		oplog_printf(ctx, "readdir (%lu,%" PRIu64 ",%" PRIu64 "): OK (no data)",
-				(unsigned long int)ino,
-				(uint64_t)maxEntries,
-				(uint64_t)off);
-	} else {
-		ptr = dirinfo->p+off;
-		eptr = dirinfo->p+dirinfo->size;
-		off_t nextoff = off; // offset of the next entry
-
-		while (ptr<eptr && ret.size() < maxEntries) {
-			sassert(ptr == dirinfo->p + nextoff);
-			nleng = ptr[0];
-			ptr++;
-			memcpy(name,ptr,nleng);
-			name[nleng]=0;
-			ptr+=nleng;
-			nextoff+=nleng+((dirinfo->dataformat)?40:6);
-			if (ptr+5<=eptr) {
-				inode = get32bit(&ptr);
-				if (dirinfo->dataformat) {
-					attr_to_stat(inode,ptr,&stbuf);
-					ptr+=35;
-				} else {
-					type = get8bit(&ptr);
-					type_to_stat(inode,type,&stbuf);
-				}
-				try {
-					ret.push_back(DirEntry{name, stbuf, nextoff});
-				} catch (std::bad_alloc& e) {
-					throw RequestException(ENOMEM);
-				}
-			}
-		}
-
-		oplog_printf(ctx, "readdir (%lu,%" PRIu64 ",%" PRIu64 "): OK (%lu)",
-				(unsigned long int)ino,
-				(uint64_t)maxEntries,
-				(uint64_t)off,
-				(unsigned long int)ret.size());
+	if (max_entries == 0) {
+		return result;
 	}
-	return ret;
+
+	access_guard.unlock();
+
+	std::vector<DirectoryEntry> dir_entries;
+	uint8_t status;
+	uint64_t request_size = std::min<std::size_t>(std::max<std::size_t>(kBatchSize, max_entries),
+	                                              matocl::fuseGetDir::kMaxNumberOfDirectoryEntries);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_getdir(ino, ctx.uid, ctx.gid, entry_index, request_size, dir_entries));
+	auto data_acquire_time = gDirEntryCache.updateTime();
+
+	if(status != LIZARDFS_STATUS_OK) {
+		throw RequestException(status);
+	}
+
+	std::unique_lock<shared_mutex> write_guard(gDirEntryCache.rwlock());
+	gDirEntryCache.updateTime();
+
+	gDirEntryCache.insertSubsequent(ctx, ino, entry_index, dir_entries, data_acquire_time);
+	if (dir_entries.size() < request_size) {
+		// insert 'no more entries' marker
+		gDirEntryCache.insert(ctx, ino, 0, entry_index + dir_entries.size(), "", Attributes{{}}, data_acquire_time);
+		gDirEntryCache.invalidate(ctx,ino,entry_index + dir_entries.size() + 1);
+	}
+
+	if (gDirEntryCache.size() > gDirEntryCacheMaxSize) {
+		gDirEntryCache.removeOldest(gDirEntryCache.size() - gDirEntryCacheMaxSize);
+	}
+
+	write_guard.unlock();
+
+	for(auto it = dir_entries.begin(); it != dir_entries.end() && max_entries > 0; ++it) {
+		--max_entries;
+		++entry_index;
+
+		struct stat stats;
+		attr_to_stat(it->inode,it->attributes,&stats);
+		result.emplace_back(it->name, stats, entry_index);
+	}
+
+	return result;
 }
 
-void releasedir(Context ctx, Inode ino, FileInfo *fi) {
+void releasedir(Context ctx, Inode ino, FileInfo */*fi*/) {
+	static constexpr int kBatchSize = 1000;
+
 	(void)ino;
-	dirbuf *dirinfo = reinterpret_cast<dirbuf *>(fi->fh);
 
 	stats_inc(OP_RELEASEDIR);
 	if (debug_mode) {
@@ -1611,19 +1616,12 @@ void releasedir(Context ctx, Inode ino, FileInfo *fi) {
 				(unsigned long int)ino);
 		fprintf(stderr,"releasedir (%lu)\n",(unsigned long int)ino);
 	}
-	PthreadMutexWrapper lock((dirinfo->lock));
-	lock.unlock(); // This unlock is needed, since we want to destroy the mutex
-	pthread_mutex_destroy(&(dirinfo->lock));
-	if (dirinfo->dcache) {
-		dcache_release(dirinfo->dcache);
-	}
-	if (dirinfo->p) {
-		free((uint8_t*)(dirinfo->p));
-	}
-	free(dirinfo);
-	fi->fh = 0;
 	oplog_printf(ctx, "releasedir (%lu): OK",
 			(unsigned long int)ino);
+
+	std::unique_lock<shared_mutex> write_guard(gDirEntryCache.rwlock());
+	gDirEntryCache.updateTime();
+	gDirEntryCache.removeExpired(kBatchSize);
 }
 
 
@@ -1672,21 +1670,12 @@ void remove_file_info(FileInfo *f) {
 	free(fileinfo);
 }
 
-void remove_dir_info(FileInfo *fi) {
-	dirbuf* dirinfo = (dirbuf*) fi->fh;
-	fi->fh = 0;
-	pthread_mutex_destroy(&(dirinfo->lock));
-	free(dirinfo);
-}
-
-
-
 EntryParam create(Context ctx, Inode parent, const char *name, mode_t mode,
 		FileInfo* fi) {
 	struct EntryParam e;
 	uint32_t inode;
 	uint8_t oflags;
-	uint8_t attr[35];
+	Attributes attr;
 	char modestr[11];
 	char attrstr[256];
 	uint8_t mattr;
@@ -1747,7 +1736,8 @@ EntryParam create(Context ctx, Inode parent, const char *name, mode_t mode,
 		throw RequestException(EINVAL);
 	}
 
-	status = fs_mknod(parent,nleng,(const uint8_t*)name,TYPE_FILE,mode&07777,ctx.umask,ctx.uid,ctx.gid,0,inode,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_mknod(parent,nleng,(const uint8_t*)name,TYPE_FILE,mode&07777,ctx.umask,ctx.uid,ctx.gid,0,inode,attr));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "create (%lu,%s,-%s:0%04o) (mknod): %s",
@@ -1758,7 +1748,10 @@ EntryParam create(Context ctx, Inode parent, const char *name, mode_t mode,
 				strerr(status));
 		throw RequestException(status);
 	}
-	status = fs_opencheck(inode,ctx.uid,ctx.gid,oflags,NULL);
+	Attributes tmp_attr;
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_opencheck(inode,ctx.uid,ctx.gid,oflags,tmp_attr));
+
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "create (%lu,%s,-%s:0%04o) (open): %s",
@@ -1785,6 +1778,7 @@ EntryParam create(Context ctx, Inode parent, const char *name, mode_t mode,
 				(unsigned long int)inode,
 				(unsigned long int)fi->keep_cache);
 	}
+	gDirEntryCache.lockAndInvalidateParent(ctx, parent);
 	e.ino = inode;
 	e.attr_timeout = (mattr&MATTR_NOACACHE)?0.0:attr_cache_timeout;
 	e.entry_timeout = (mattr&MATTR_NOECACHE)?0.0:entry_cache_timeout;
@@ -1805,7 +1799,7 @@ EntryParam create(Context ctx, Inode parent, const char *name, mode_t mode,
 
 void open(Context ctx, Inode ino, FileInfo *fi) {
 	uint8_t oflags;
-	uint8_t attr[35];
+	Attributes attr;
 	uint8_t mattr;
 	int status;
 
@@ -1831,7 +1825,8 @@ void open(Context ctx, Inode ino, FileInfo *fi) {
 	} else if ((fi->flags & O_ACCMODE) == O_RDWR) {
 		oflags |= WANT_READ | WANT_WRITE;
 	}
-	status = fs_opencheck(ino,ctx.uid,ctx.gid,oflags,attr);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_opencheck(ino,ctx.uid,ctx.gid,oflags,attr));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "open (%lu): %s",
@@ -1860,6 +1855,13 @@ void open(Context ctx, Inode ino, FileInfo *fi) {
 			(unsigned long int)ino,
 			(unsigned long int)fi->direct_io,
 			(unsigned long int)fi->keep_cache);
+}
+
+void update_credentials(int index, const GroupCache::Groups &groups) {
+	uint8_t status = fs_update_credentials(index, groups);
+	if (status != LIZARDFS_STATUS_OK) {
+		throw RequestException(errorconv_dbg(status));
+	}
 }
 
 void release(Context ctx, Inode ino, FileInfo *fi) {
@@ -2253,15 +2255,20 @@ class PlainXattrHandler : public XattrHandler {
 public:
 	virtual uint8_t setxattr(const Context& ctx, Inode ino, const char *name,
 			uint32_t nleng, const char *value, size_t size, int mode) {
-		return fs_setxattr(ino, 0, ctx.uid, ctx.gid, nleng, (const uint8_t*)name,
-				(uint32_t)size, (const uint8_t*)value, mode);
+		uint8_t status;
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_setxattr(ino, 0, ctx.uid, ctx.gid, nleng, (const uint8_t*)name,
+				(uint32_t)size, (const uint8_t*)value, mode));
+		return status;
 	}
 
 	virtual uint8_t getxattr(const Context& ctx, Inode ino, const char *name,
 			uint32_t nleng, int mode, uint32_t& valueLength, std::vector<uint8_t>& value) {
 		const uint8_t *buff;
-		uint8_t status = fs_getxattr(ino, 0, ctx.uid, ctx.gid, nleng, (const uint8_t*)name,
-				mode, &buff, &valueLength);
+		uint8_t status;
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_getxattr(ino, 0, ctx.uid, ctx.gid, nleng, (const uint8_t*)name,
+				mode, &buff, &valueLength));
 		if (mode == XATTR_GMODE_GET_DATA && status == LIZARDFS_STATUS_OK) {
 			value = std::vector<uint8_t>(buff, buff + valueLength);
 		}
@@ -2270,7 +2277,10 @@ public:
 
 	virtual uint8_t removexattr(const Context& ctx, Inode ino, const char *name,
 			uint32_t nleng) {
-		return fs_removexattr(ino, 0, ctx.uid, ctx.gid, nleng, (const uint8_t*)name);
+		uint8_t status;
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_removexattr(ino, 0, ctx.uid, ctx.gid, nleng, (const uint8_t*)name));
+		return status;
 	}
 };
 
@@ -2301,23 +2311,28 @@ public:
 
 	virtual uint8_t setxattr(const Context& ctx, Inode ino, const char *,
 			uint32_t, const char *value, size_t size, int) {
+		static constexpr size_t kEmptyAclSize = 4;
 		if (!acl_enabled) {
 			return LIZARDFS_ERROR_ENOTSUP;
 		}
 		AccessControlList acl;
 		try {
-			PosixAclXattr posix = aclConverter::extractPosixObject((const uint8_t*)value, size);
-			if (posix.entries.empty()) {
-				// Is empty ACL set? It means to remove it!
-				return fs_deletacl(ino, ctx.uid, ctx.gid, type_);
+			if (size <= kEmptyAclSize) {
+				uint8_t status;
+				RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+					fs_deletacl(ino, ctx.uid, ctx.gid, type_));
+				return status;
 			}
-			acl = aclConverter::posixToAclObject(posix);
+			acl = aclConverter::extractAclObject((const uint8_t*)value, size);
 		} catch (Exception&) {
 			return LIZARDFS_ERROR_EINVAL;
 		}
-		auto ret = fs_setacl(ino, ctx.uid, ctx.gid, type_, acl);
+		uint8_t status;
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_setacl(ino, ctx.uid, ctx.gid, type_, acl));
 		eraseAclCache(ino);
-		return ret;
+		gDirEntryCache.lockAndInvalidateInode(ino);
+		return status;
 	}
 
 	virtual uint8_t getxattr(const Context& ctx, Inode ino, const char *,
@@ -2349,9 +2364,11 @@ public:
 		if (!acl_enabled) {
 			return LIZARDFS_ERROR_ENOTSUP;
 		}
-		auto ret = fs_deletacl(ino, ctx.uid, ctx.gid, type_);
+		uint8_t status;
+		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+			fs_deletacl(ino, ctx.uid, ctx.gid, type_));
 		eraseAclCache(ino);
-		return ret;
+		return status;
 	}
 
 private:
@@ -2367,8 +2384,8 @@ static ErrorXattrHandler enotsupXattrHandler(LIZARDFS_ERROR_ENOTSUP);
 static PlainXattrHandler plainXattrHandler;
 
 static std::map<std::string, XattrHandler*> xattr_handlers = {
-	{POSIX_ACL_XATTR_ACCESS, &accessAclXattrHandler},
-	{POSIX_ACL_XATTR_DEFAULT, &defaultAclXattrHandler},
+	{"system.posix_acl_access", &accessAclXattrHandler},
+	{"system.posix_acl_default", &defaultAclXattrHandler},
 	{"security.capability", &enotsupXattrHandler},
 };
 
@@ -2629,7 +2646,8 @@ XattrReply listxattr(Context ctx, Inode ino, size_t size) {
 	} else {
 		mode = XATTR_GMODE_GET_DATA;
 	}
-	status = fs_listxattr(ino,0,ctx.uid,ctx.gid,mode,&buff,&leng);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx.gid,
+		fs_listxattr(ino,0,ctx.uid,ctx.gid,mode,&buff,&leng));
 	status = errorconv_dbg(status);
 	if (status!=0) {
 		oplog_printf(ctx, "listxattr (%lu,%" PRIu64 "): %s",
@@ -2859,7 +2877,7 @@ void flock_recv() {
 	}
 }
 
-void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_,
+void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_, unsigned direntry_cache_size_,
 		double entry_cache_timeout_, double attr_cache_timeout_, int mkdir_copy_sgid_,
 		SugidClearMode sugid_clear_mode_, bool acl_enabled_, bool use_rwlock_,
 		double acl_cache_timeout_, unsigned acl_cache_size_) {
@@ -2873,6 +2891,9 @@ void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_,
 	sugid_clear_mode = static_cast<decltype (sugid_clear_mode)>(sugid_clear_mode_);
 	acl_enabled = acl_enabled_;
 	use_rwlock = use_rwlock_;
+	uint64_t timeout = (uint64_t)(direntry_cache_timeout * 1000000);
+	gDirEntryCache.setTimeout(timeout);
+	gDirEntryCacheMaxSize = direntry_cache_size_;
 	if (debug_mode) {
 		fprintf(stderr,"cache parameters: file_keep_cache=%s direntry_cache_timeout=%.2f entry_cache_timeout=%.2f attr_cache_timeout=%.2f\n",(keep_cache==1)?"always":(keep_cache==2)?"never":"auto",direntry_cache_timeout,entry_cache_timeout,attr_cache_timeout);
 		fprintf(stderr,"mkdir copy sgid=%d\nsugid clear mode=%s\n",mkdir_copy_sgid_,(sugid_clear_mode<SUGID_CLEAR_MODE_OPTIONS)?sugid_clear_mode_strings[sugid_clear_mode]:"???");

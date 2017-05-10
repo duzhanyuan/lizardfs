@@ -48,6 +48,28 @@ void checkTypesEqual(const A& a, const B& b) {
 			"Types don't match");
 }
 
+void updateGroupsForContext(fuse_req_t &req, LizardClient::Context &ctx) {
+#if defined(__APPLE__)
+	(void)req, (void)ctx;
+#else
+	static const int kMaxGroups = GroupCache::kDefaultGroupsSize - 1;
+
+	GroupCache::Groups groups(kMaxGroups + 1);
+	// First group is always the primary group. It may be duplicated later but it is not a problem.
+	groups[0] = ctx.gid;
+	int getgroups_ret = fuse_req_getgroups(req, kMaxGroups, groups.data() + 1);
+	if (getgroups_ret > kMaxGroups) {
+		groups.resize(getgroups_ret + 1);
+		getgroups_ret = fuse_req_getgroups(req, groups.size() - 1, groups.data() + 1);
+	} else if (getgroups_ret >= 0) {
+		groups.resize(getgroups_ret + 1);
+	}
+	if (getgroups_ret > 0) {
+		ctx.gid = LizardClient::updateGroups(groups);
+	}
+#endif
+}
+
 /**
  * A function converting fuse_ctx to LizardClient::Context
  */
@@ -63,7 +85,7 @@ LizardClient::Context get_context(fuse_req_t& req) {
 	checkTypesEqual(ret.gid,   fuse_ctx->gid);
 	checkTypesEqual(ret.pid,   fuse_ctx->pid);
 	checkTypesEqual(ret.umask, umask);
-
+	updateGroupsForContext(req, ret);
 	return ret;
 }
 
@@ -286,7 +308,7 @@ void mfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	try {
 		LizardClient::opendir(get_context(req), ino, fuse_file_info_wrapper(fi));
 		if (fuse_reply_open(req, fi) == -ENOENT) {
-			LizardClient::remove_dir_info(fuse_file_info_wrapper(fi));
+			assert(fi->fh == 0);
 		}
 	} catch (LizardClient::RequestException& e) {
 		fuse_reply_err(req, e.errNo);
@@ -486,12 +508,14 @@ void mfs_removexattr (fuse_req_t req, fuse_ino_t ino, const char *name) {
 }
 
 void mfs_init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_,
-		double entry_cache_timeout_, double attr_cache_timeout_, int mkdir_copy_sgid_,
-		SugidClearMode sugid_clear_mode_, bool acl_enabled_, double acl_cache_timeout_,
-		unsigned acl_cache_size_, bool use_rwlock_) {
-	LizardClient::init(debug_mode_, keep_cache_, direntry_cache_timeout_, entry_cache_timeout_,
-			attr_cache_timeout_, mkdir_copy_sgid_, sugid_clear_mode_, acl_enabled_, use_rwlock_,
-			acl_cache_timeout_, acl_cache_size_);
+		unsigned direntry_cache_size_, double entry_cache_timeout_,
+		double attr_cache_timeout_, int mkdir_copy_sgid_, SugidClearMode sugid_clear_mode_,
+		bool acl_enabled_, double acl_cache_timeout_, unsigned acl_cache_size_,
+		bool use_rwlock_) {
+	LizardClient::init(debug_mode_, keep_cache_, direntry_cache_timeout_, direntry_cache_size_,
+	                   entry_cache_timeout_, attr_cache_timeout_, mkdir_copy_sgid_,
+	                   sugid_clear_mode_, acl_enabled_, use_rwlock_, acl_cache_timeout_,
+	                   acl_cache_size_);
 }
 
 #if FUSE_VERSION >= 26

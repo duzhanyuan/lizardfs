@@ -1,5 +1,5 @@
 /*
-   Copyright 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o.
+   Copyright 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -25,7 +25,10 @@
 #include "common/chunk_type_with_address.h"
 #include "common/chunk_with_address_and_label.h"
 #include "common/chunks_availability_state.h"
+#include "common/defective_file_info.h"
 #include "common/io_limits_database.h"
+#include "common/job_info.h"
+#include "common/legacy_acl.h"
 #include "common/metadataserver_list_entry.h"
 #include "common/moosefs_string.h"
 #include "common/moosefs_vector.h"
@@ -33,10 +36,15 @@
 #include "common/serialized_goal.h"
 #include "common/tape_copy_location_info.h"
 #include "protocol/chunkserver_list_entry.h"
+#include "protocol/directory_entry.h"
 #include "protocol/lock_info.h"
 #include "protocol/MFSCommunication.h"
 #include "protocol/packet.h"
 #include "protocol/quota.h"
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(matocl, updateCredentials, LIZ_MATOCL_UPDATE_CREDENTIALS, 0,
+		uint32_t, messageId,
+		uint8_t, status)
 
 // LIZ_MATOCL_FUSE_MKNOD
 LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseMknod, kStatusPacketVersion, 0)
@@ -76,12 +84,18 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 
 // LIZ_MATOCL_FUSE_GET_ACL
 LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kStatusPacketVersion, 0)
-LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kResponsePacketVersion, 1)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kLegacyResponsePacketVersion, 1)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kResponsePacketVersion, 2)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetAcl, LIZ_MATOCL_FUSE_GET_ACL, kStatusPacketVersion,
 		uint32_t, messageId,
 		uint8_t, status)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetAcl, LIZ_MATOCL_FUSE_GET_ACL, kLegacyResponsePacketVersion,
+		uint32_t, messageId,
+		legacy::AccessControlList, acl)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetAcl, LIZ_MATOCL_FUSE_GET_ACL, kResponsePacketVersion,
@@ -368,6 +382,72 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, manageLocksUnlock, LIZ_MATOCL_MANAGE_LOCKS_UNLOCK, 0,
 		uint8_t, status)
+
+// LIZ_MATOCL_WHOLE_PATH_LOOKUP
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, wholePathLookup, kStatusPacketVersion, 0)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, wholePathLookup, kResponsePacketVersion, 1)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, wholePathLookup, LIZ_MATOCL_WHOLE_PATH_LOOKUP, kStatusPacketVersion,
+		uint32_t, messageId,
+		uint8_t, status)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, wholePathLookup, LIZ_MATOCL_WHOLE_PATH_LOOKUP, kResponsePacketVersion,
+		uint32_t, messageId,
+		uint32_t, inode,
+		Attributes, attr)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, recursiveRemove, LIZ_MATOCL_RECURSIVE_REMOVE, 0,
+		uint32_t, msgid,
+		uint8_t, status)
+
+// LIZ_MATOCL_FUSE_GETDIR
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetDir, kStatus, 0)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetDir, kResponse, 1)
+
+namespace matocl {
+namespace fuseGetDir {
+	const uint64_t kMaxNumberOfDirectoryEntries = 1 << 13;
+}
+}
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetDir, LIZ_MATOCL_FUSE_GETDIR, kStatus,
+		uint32_t, messageId,
+		uint8_t, status)
+
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetDir, LIZ_MATOCL_FUSE_GETDIR, kResponse,
+		uint32_t, message_id,
+		uint64_t, first_entry_index,
+		std::vector<DirectoryEntry>, dir_entry)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, listTasks, LIZ_MATOCL_LIST_TASKS, 0,
+		std::vector<JobInfo>, jobs_info)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, stopTask, LIZ_MATOCL_STOP_TASK, 0,
+		uint32_t, msgid,
+		uint8_t, status)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, requestTaskId, LIZ_MATOCL_REQUEST_TASK_ID, 0,
+		uint32_t, msgid,
+		uint32_t, taskid)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, snapshot, LIZ_MATOCL_FUSE_SNAPSHOT, 0,
+		uint32_t, msgid,
+		uint8_t, status)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, listDefectiveFiles, LIZ_MATOCL_LIST_DEFECTIVE_FILES, 0,
+		uint64_t, last_entry_index,
+		std::vector<DefectiveFileInfo>, files_info)
 
 namespace matocl {
 

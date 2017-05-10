@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "common/exception.h"
+#include "mount/group_cache.h"
 #include "mount/lizard_client_context.h"
 #include "mount/readdata_cache.h"
 #include "mount/stat_defs.h"
@@ -91,6 +92,8 @@ struct DirEntry {
 	std::string name;
 	struct stat attr;
 	off_t nextEntryOffset;
+
+	DirEntry(const std::string n, const struct stat &s, off_t o) : name(n), attr(s), nextEntryOffset(o) {}
 };
 
 /**
@@ -110,11 +113,15 @@ struct RequestException : public std::exception {
 	int errNo;
 };
 
+int updateGroups(const GroupCache::Groups &groups);
+
 // TODO what about this one? Will decide when writing non-fuse client
 // void fsinit(void *userdata, struct fuse_conn_info *conn);
 bool isSpecialInode(LizardClient::Inode ino);
 
-EntryParam lookup(Context ctx, Inode parent, const char *name);
+void update_credentials(int index, const GroupCache::Groups &groups);
+
+EntryParam lookup(Context ctx, Inode parent, const char *name, bool whole_path_lookup = false);
 
 AttrReply getattr(Context ctx, Inode ino, FileInfo* fi);
 
@@ -197,9 +204,9 @@ void flock_interrupt(const lzfs_locks::InterruptData &data);
 void setlk_interrupt(const lzfs_locks::InterruptData &data);
 
 void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_,
-		double entry_cache_timeout_, double attr_cache_timeout_, int mkdir_copy_sgid_,
-		SugidClearMode sugid_clear_mode_, bool acl_enabled_, bool use_rw_lock_,
-		double acl_cache_timeout_, unsigned acl_cache_size_);
+		unsigned direntry_cache_size_, double entry_cache_timeout_, double attr_cache_timeout_,
+		int mkdir_copy_sgid_, SugidClearMode sugid_clear_mode_, bool acl_enabled_,
+		bool use_rw_lock_, double acl_cache_timeout_, unsigned acl_cache_size_);
 
 void remove_file_info(FileInfo *f);
 void remove_dir_info(FileInfo *f);

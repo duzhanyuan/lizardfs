@@ -1,5 +1,5 @@
 /*
-   Copyright 2015 Skytechnology sp. z o.o.
+   Copyright 2015-2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -19,36 +19,29 @@
 #pragma once
 
 #include "common/platform.h"
+
+#include "master/filesystem.h"
 #include "master/fs_context.h"
 
-/*! \brief Deprecated snapshot function.
- *
- * This is the old snapshot function. It has many built-in problems.
- * First of all it might be executing for a very long time (we need to process all nodes,
- * and sometimes this number is in millions) which in result blocks metadata server.
- * Secondly it doesn't write to changelog information about inodes of newly cloned files.
- * This requires that shadow has built-in oracle that can guess what inode numbers is master using.
- */
-uint8_t fs_deprecated_snapshot(const FsContext &context, uint32_t inode_src, uint32_t parent_dst,
-		const HString &name_dst, uint8_t can_overwrite);
+void fs_read_snapshot_config_file();
 
 /*! \brief Register snapshot task.
  *
  * \param context server context.
  * \param inode_src number of inode to clone.
  * \param parent_dst number of inode of the directory where source inode should be cloned to.
- * \param nleng_dst length of name_dst in characters.
  * \param name_dst clone name.
  * \param can_overwrite if true then cloning process can overwrite existing nodes.
  * \param callback function that should be executed on finish of snapshot task.
+ * \param job_id desired id for this snapshot request.
  */
 uint8_t fs_snapshot(const FsContext &context, uint32_t inode_src, uint32_t parent_dst,
-		const HString &name_dst, uint8_t can_overwrite,
-		const std::function<void(int)> &callback);
+		const HString &name_dst, uint8_t can_overwrite, uint8_t ignore_missing_src, uint32_t initial_batch_size,
+		const std::function<void(int)> &callback, uint32_t job_id);
 
 /*! \brief Clone one inode.
  *
- * \param contex server context.
+ * \param context server context.
  * \param inode_src number of inode to clone.
  * \param parent_dst number of inode of the directory where source inode should be cloned to.
  * \param inode_dst inode number that should be used for clone's inode.

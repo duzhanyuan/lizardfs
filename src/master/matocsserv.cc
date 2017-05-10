@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o..
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
 
@@ -36,12 +36,13 @@
 #include <vector>
 
 #include "common/cfg.h"
+#include "common/counting_sort.h"
 #include "common/datapack.h"
+#include "common/event_loop.h"
 #include "common/goal.h"
 #include "common/hashfn.h"
 #include "common/lizardfs_version.h"
 #include "common/loop_watchdog.h"
-#include "common/main.h"
 #include "common/massert.h"
 #include "common/mfserr.h"
 #include "common/output_packet.h"
@@ -65,6 +66,8 @@
 
 // matocsserventry.mode
 enum{KILL, CONNECTED};
+
+double gLoadFactorPenalty = 0.;
 
 struct matocsserventry {
 	matocsserventry() : inputPacket(MaxPacketSize) {}
@@ -91,10 +94,21 @@ struct matocsserventry {
 	uint16_t rrepcounter;
 	uint16_t wrepcounter;
 	uint16_t delcounter;
+	uint8_t load_factor;
 
 	csdbentry *csdb; /*!< Pointer to database entry for chunkserver. */
 
 	matocsserventry *next;
+
+	static bool lessUsedAndLoaded(matocsserventry *first, matocsserventry *second) {
+		double first_load_penalty = gLoadFactorPenalty * (double)first->load_factor / 100.;
+		double second_load_penalty = gLoadFactorPenalty * (double)second->load_factor / 100.;
+
+		double first_usage = double(first->usedspace) / double(first->totalspace) + first_load_penalty;
+		double second_usage = double(second->usedspace) / double(second->totalspace) + second_load_penalty;
+
+		return first_usage < second_usage;
+	}
 };
 
 static matocsserventry *matocsservhead=NULL;
@@ -345,8 +359,8 @@ std::vector<ServerWithUsage> matocsserv_getservers_sorted() {
 			result.emplace_back(eptr, usage, eptr->label);
 		}
 	}
-	std::sort(result.begin(), result.end(), [](const ServerWithUsage& a, const ServerWithUsage& b) {
-		return a.diskUsage < b.diskUsage;
+	std::sort(result.begin(), result.end(), [](const ServerWithUsage &u1, const ServerWithUsage &u2){
+		return matocsserventry::lessUsedAndLoaded(u1.server, u2.server);
 	});
 	return result;
 }
@@ -371,7 +385,7 @@ std::vector<std::pair<matocsserventry *, ChunkPartType>> matocsserv_getservers_f
 			//
 			// weight = percent free spaces
 			const int64_t weight = 1024 * 1024 * (1. - matocsserv_get_usage(eptr));
-			getter.addServer(eptr, eptr->label, weight, eptr->version);
+			getter.addServer(eptr, eptr->label, weight, eptr->version, eptr->load_factor);
 		}
 	}
 
@@ -436,7 +450,7 @@ std::vector<std::pair<matocsserventry *, ChunkPartType>> matocsserv_getservers_f
 }
 
 void matocsserv_getservers_lessrepl(const MediaLabel &label, uint32_t min_chunkserver_version,
-		uint16_t replication_write_limit, std::vector<matocsserventry *> &servers,
+		uint16_t replication_write_limit, const IpCounter &ip_counter, std::vector<matocsserventry *> &servers,
 		int &total_matching, int &returned_matching, int &temporarily_unavailable) {
 	total_matching = 0;
 	returned_matching = 0;
@@ -468,9 +482,17 @@ void matocsserv_getservers_lessrepl(const MediaLabel &label, uint32_t min_chunks
 		}
 	}
 	std::random_shuffle(servers.begin(), servers.end());
+	std::sort(servers.begin(), servers.end(), matocsserventry::lessUsedAndLoaded);
+	if (gAvoidSameIpChunkservers) {
+		counting_sort(servers, [&ip_counter](matocsserventry *server) {
+			auto it = ip_counter.find(server->servip);
+			return it != ip_counter.end() ? it->second : 0;
+		});
+	}
+
 	if (returned_matching > 0) {
 		// Move servers matching the requested label to the front of the servers array
-		std::partition(servers.begin(), servers.end(), [&label](matocsserventry* cs) {
+		std::stable_partition(servers.begin(), servers.end(), [&label](matocsserventry* cs) {
 			return cs->label == label;
 		});
 	}
@@ -510,6 +532,11 @@ const char* matocsserv_getstrip(matocsserventry *eptr) {
 		return eptr->servstrip;
 	}
 	return empty;
+}
+
+uint32_t matocsserv_get_servip(matocsserventry *e) {
+	assert(e);
+	return e->servip;
 }
 
 int matocsserv_getlocation(matocsserventry *eptr,uint32_t *servip,uint16_t *servport,
@@ -1238,8 +1265,7 @@ void matocsserv_space(matocsserventry *eptr,const uint8_t *data,uint32_t length)
 	}
 }
 
-void matocsserv_liz_register_host(matocsserventry *eptr, const std::vector<uint8_t>& data)
-		throw (IncorrectDeserializationException) {
+void matocsserv_liz_register_host(matocsserventry *eptr, const std::vector<uint8_t>& data) {
 	uint32_t version;
 	uint32_t servip;
 	uint16_t servport;
@@ -1248,8 +1274,7 @@ void matocsserv_liz_register_host(matocsserventry *eptr, const std::vector<uint8
 	return matocsserv_register_host(eptr, version, servip, servport, timeout);
 }
 
-void matocsserv_liz_register_chunks(matocsserventry *eptr, const std::vector<uint8_t>& data)
-		throw (IncorrectDeserializationException) {
+void matocsserv_liz_register_chunks(matocsserventry *eptr, const std::vector<uint8_t>& data) {
 	PacketVersion v;
 	deserializePacketVersionNoHeader(data, v);
 	if (v == cstoma::registerChunks::kECChunks) {
@@ -1273,15 +1298,13 @@ void matocsserv_liz_register_chunks(matocsserventry *eptr, const std::vector<uin
 	}
 }
 
-void matocsserv_liz_register_space(matocsserventry *eptr, const std::vector<uint8_t>& data)
-		throw (IncorrectDeserializationException) {
+void matocsserv_liz_register_space(matocsserventry *eptr, const std::vector<uint8_t>& data) {
 	cstoma::registerSpace::deserialize(data, eptr->usedspace, eptr->totalspace, eptr->chunkscount,
 			eptr->todelusedspace, eptr->todeltotalspace, eptr->todelchunkscount);
 	return register_space(eptr);
 }
 
-void matocsserv_liz_register_label(matocsserventry *eptr, const std::vector<uint8_t>& data)
-		throw (IncorrectDeserializationException) {
+void matocsserv_liz_register_label(matocsserventry *eptr, const std::vector<uint8_t>& data) {
 	std::string label;
 	cstoma::registerLabel::deserialize(data, label);
 	if (!MediaLabelManager::isLabelValid(label)) {
@@ -1304,6 +1327,12 @@ void matocsserv_liz_register_label(matocsserventry *eptr, const std::vector<uint
 		eptr->label = MediaLabel(label);
 		eptr->csdb->label = eptr->label;
 	}
+}
+
+void matocsserv_liz_status(matocsserventry *eptr, const std::vector<uint8_t> &data) {
+	uint8_t load_factor;
+	cstoma::status::deserialize(data, load_factor);
+	eptr->load_factor = load_factor;
 }
 
 void matocsserv_chunk_damaged(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
@@ -1520,6 +1549,9 @@ void matocsserv_gotpacket(matocsserventry *eptr, PacketHeader header, const Mess
 				break;
 			case LIZ_CSTOMA_REGISTER_LABEL:
 				matocsserv_liz_register_label(eptr, data);
+				break;
+			case LIZ_CSTOMA_STATUS:
+				matocsserv_liz_status(eptr, data);
 				break;
 			default:
 				syslog(LOG_NOTICE,"master <-> chunkservers module: got unknown message "
@@ -1741,6 +1773,7 @@ void matocsserv_reload(void) {
 	oldListenPort = ListenPort;
 	ListenHost = cfg_getstr("MATOCS_LISTEN_HOST","*");
 	ListenPort = cfg_getstr("MATOCS_LISTEN_PORT","9420");
+	gLoadFactorPenalty = cfg_get_minmaxvalue<double>("LOAD_FACTOR_PENALTY", 0., 0., 0.5);
 	if (strcmp(oldListenHost,ListenHost)==0 && strcmp(oldListenPort,ListenPort)==0) {
 		free(oldListenHost);
 		free(oldListenPort);
@@ -1786,6 +1819,7 @@ uint32_t matocsserv_get_version(matocsserventry *e) {
 int matocsserv_init(void) {
 	ListenHost = cfg_getstr("MATOCS_LISTEN_HOST","*");
 	ListenPort = cfg_getstr("MATOCS_LISTEN_PORT","9420");
+	gLoadFactorPenalty = cfg_get_minmaxvalue<double>("LOAD_FACTOR_PENALTY", 0., 0., 0.5);
 
 	lsock = tcpsocket();
 	if (lsock<0) {
@@ -1806,8 +1840,8 @@ int matocsserv_init(void) {
 
 	matocsserv_replication_init();
 	matocsservhead = NULL;
-	main_reloadregister(matocsserv_reload);
-	main_destructregister(matocsserv_term);
-	main_pollregister(matocsserv_desc,matocsserv_serve);
+	eventloop_reloadregister(matocsserv_reload);
+	eventloop_destructregister(matocsserv_term);
+	eventloop_pollregister(matocsserv_desc,matocsserv_serve);
 	return 0;
 }

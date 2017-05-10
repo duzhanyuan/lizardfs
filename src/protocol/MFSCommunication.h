@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o..
+   Copyright 2005-2017 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
 
@@ -102,8 +102,8 @@
 #define LIZARDFS_ERROR_NOCHUNK                 13    // No such chunk
 #define LIZARDFS_ERROR_CHUNKBUSY               14    // Chunk is busy
 #define LIZARDFS_ERROR_REGISTER                15    // Incorrect register BLOB
-#define LIZARDFS_ERROR_NOTDONE                 16    // None of chunk servers performed requested operation
-#define LIZARDFS_ERROR_NOTOPENED               17    // File not opened
+#define LIZARDFS_ERROR_NOTDONE                 16    // Requested operation not completed
+#define LIZARDFS_ERROR_GROUPNOTREGISTERED      17    // Group info is not registered in master server
 #define LIZARDFS_ERROR_NOTSTARTED              18    // Write not started
 #define LIZARDFS_ERROR_WRONGVERSION            19    // Wrong chunk version
 #define LIZARDFS_ERROR_CHUNKEXIST              20    // Chunk already exists
@@ -158,8 +158,8 @@
 	"No such chunk", \
 	"Chunk is busy", \
 	"Incorrect register BLOB", \
-	"None of chunk servers performed requested operation", \
-	"File not opened", \
+	"Requested operation not completed", \
+	"Group info is not registered in master server", \
 	"Write not started", \
 	"Wrong chunk version", \
 	"Chunk already exists", \
@@ -689,6 +689,10 @@ enum class SugidClearMode {
 #define LIZ_CSTOMA_DUPTRUNC_CHUNK (1000U + 171U)
 /// version==0 chunkid:64 chunktype:8 status:8
 /// version==1 chunkid:64 chunktype:16 status:8
+
+// 0x0494
+#define LIZ_CSTOMA_STATUS (1000U + 172U)
+/// load:8
 
 // CHUNKSERVER <-> CLIENT/CHUNKSERVER
 
@@ -1358,6 +1362,15 @@ enum class SugidClearMode {
 
 //0x01E3
 #define LIZ_MATOCL_CHUNK_INFO (1000U + 483U)
+
+//0x01E4
+#define LIZ_CLTOMA_UPDATE_CREDENTIALS (1000U + 484U)
+/// mgsid:32 index:32 gids:(vector<gid>)
+
+//0x01E5
+#define LIZ_MATOCL_UPDATE_CREDENTIALS (1000U + 485U)
+/// msgid:32 status:8
+
 /// version==0 msgid:32 status:8
 /// version==1 msgid:32 filelength:64 chunkid:64 chunkversion:32 locations:(N * [ip:32 port:16 label:STDSTRING chunktype:8])
 /// version==2 msgid:32 filelength:64 chunkid:64 chunkversion:32 locations:(N * [ip:32 port:16 label:STDSTRING chunktype:16])
@@ -1516,14 +1529,6 @@ enum class SugidClearMode {
 #define MATOCL_MLOG_LIST (PROTO_BASE+523)
 // N * [ version:32 ip:32 ]
 
-// 0x05F2
-#define LIZ_CLTOMA_METADATASERVERS_LIST (1000U + 522U)
-/// -
-
-// 0x05F3
-#define LIZ_MATOCL_METADATASERVERS_LIST (1000U + 523U)
-// masterversion:32 data:(N * [ ip:32 hostname:STDSTRING version:32])
-
 // 0x0020C
 #define CLTOMA_CSSERV_REMOVESERV (PROTO_BASE+524)
 /// ip:32 port:16
@@ -1531,6 +1536,14 @@ enum class SugidClearMode {
 // 0x0020D
 #define MATOCL_CSSERV_REMOVESERV (PROTO_BASE+525)
 /// -
+
+// 0x05F2
+#define LIZ_CLTOMA_METADATASERVERS_LIST (1000U + 522U)
+/// -
+
+// 0x05F3
+#define LIZ_MATOCL_METADATASERVERS_LIST (1000U + 523U)
+// masterversion:32 data:(N * [ ip:32 hostname:STDSTRING version:32])
 
 // 0x05F6
 #define LIZ_CLTOMA_CHUNKS_HEALTH (1000U + 526U)
@@ -1777,6 +1790,71 @@ enum class SugidClearMode {
 // 0x62E
 #define LIZ_MATOCL_MANAGE_LOCKS_UNLOCK (1000U + 582U)
 /// status:8
+
+// 0x62F
+#define LIZ_CLTOMA_WHOLE_PATH_LOOKUP (1000U + 583U)
+/// msgid:32 inode:32 name:NAME uid:32 gid:32
+
+// 0x630
+#define LIZ_MATOCL_WHOLE_PATH_LOOKUP (1000U + 584U)
+/// msgid:32 status:8
+/// msgid:32 inode:32 attr:35B
+
+// 0x631
+#define LIZ_CLTOMA_RECURSIVE_REMOVE (1000U + 585U)
+/// msgid:32 inode:32 name:NAME uid:32 gid:32
+
+// 0x632
+#define LIZ_MATOCL_RECURSIVE_REMOVE (1000U + 586U)
+/// msgid:32 status:8
+
+// 0x633
+#define LIZ_CLTOMA_FUSE_GETDIR (1000U + 587U)
+/// msgid:32 status:8
+
+// 0x634
+#define LIZ_MATOCL_FUSE_GETDIR (1000U + 588U)
+/// msgid:32 status:8
+
+// 0x635
+#define LIZ_CLTOMA_LIST_TASKS (1000U + 589U)
+/// dummy:8
+
+// 0x636
+#define LIZ_MATOCL_LIST_TASKS (1000U + 590U)
+/// goals:(vector<JobInfo>)
+
+// 0x637
+#define LIZ_CLTOMA_STOP_TASK (1000U + 591U)
+/// msgid:32 taskid:32
+
+// 0x638
+#define LIZ_MATOCL_STOP_TASK (1000U + 592U)
+/// msgid:32 status:8
+
+// 0x639
+#define LIZ_CLTOMA_REQUEST_TASK_ID (1000U + 593U)
+/// msgid:32
+
+// 0x63A
+#define LIZ_MATOCL_REQUEST_TASK_ID (1000U + 594U)
+/// msgid:32 taskid:32
+
+// 0x63B
+#define LIZ_CLTOMA_FUSE_SNAPSHOT (1000U + 595U)
+/// msgid:32 jobid:32 inode:32 inode_dst:32 name_dst:NAME uid:32 gid:32 canoverwrite:8 ignore_missing_src:8 initial_batch:32
+
+// 0x63C
+#define LIZ_MATOCL_FUSE_SNAPSHOT (1000U + 596U)
+/// msgid:32 status:8
+
+// 0x63D
+#define LIZ_CLTOMA_LIST_DEFECTIVE_FILES (1000U + 597U)
+/// flags:8 first_entry:64 number_of_entries:64
+
+// 0x63E
+#define LIZ_MATOCL_LIST_DEFECTIVE_FILES (1000U + 598U)
+/// last_entry_index:64 files:(vector<DefectiveFileInfo>)
 
 // CHUNKSERVER STATS
 

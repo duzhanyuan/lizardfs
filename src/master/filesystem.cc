@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o..
+   Copyright 2005-2017 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
 
@@ -20,6 +20,7 @@
 #include "master/filesystem.h"
 
 #include "common/cfg.h"
+#include "common/event_loop.h"
 #include "common/lockfile.h"
 #include "common/main.h"
 #include "common/metadata.h"
@@ -231,7 +232,7 @@ int fs_loadall(void) {
 }
 
 void fs_cs_disconnected(void) {
-	gTestStartTime = main_time() + gOperationsDelayDisconnect;
+	gTestStartTime = eventloop_time() + gOperationsDelayDisconnect;
 }
 
 /*
@@ -243,11 +244,8 @@ void fs_become_master() {
 		exit(1);
 	}
 	dcm_clear();
-	gTestStartTime = main_time() + gOperationsDelayInit;
-	main_timeregister(TIMEMODE_RUN_LATE, 1, 0, fs_periodic_test_files);
-	main_eachloopregister(fs_background_checksum_recalculation_a_bit);
-	main_eachloopregister(fs_background_task_manager_work);
-	main_timeregister_ms(100, fs_periodic_emptytrash);
+	gTestStartTime = eventloop_time() + gOperationsDelayInit;
+	fs_periodic_master_init();
 	return;
 }
 
@@ -322,6 +320,8 @@ static void fs_read_config_file() {
 
 	chunk_invalidate_goal_cache();
 	fs_read_goal_config_file(); // may throw
+	fs_read_snapshot_config_file();
+	fs_read_periodic_config_file();
 }
 
 void fs_reload(void) {
@@ -365,17 +365,17 @@ int fs_init(bool doLoad) {
 	if (doLoad || (metadataserver::isMaster())) {
 		fs_loadall();
 	}
-	main_reloadregister(fs_reload);
+	eventloop_reloadregister(fs_reload);
 	metadataserver::registerFunctionCalledOnPromotion(fs_become_master);
 	if (!cfg_isdefined("MAGIC_DISABLE_METADATA_DUMPS")) {
 		// Secret option disabling periodic metadata dumps
-		main_timeregister(TIMEMODE_RUN_LATE,3600,0,fs_periodic_storeall);
+		eventloop_timeregister(TIMEMODE_RUN_LATE,3600,0,fs_periodic_storeall);
 	}
 	if (metadataserver::isMaster()) {
 		fs_become_master();
 	}
-	main_pollregister(metadataPollDesc, metadataPollServe);
-	main_destructregister(fs_term);
+	eventloop_pollregister(metadataPollDesc, metadataPollServe);
+	eventloop_destructregister(fs_term);
 	return 0;
 }
 
