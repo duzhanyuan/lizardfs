@@ -33,8 +33,6 @@
 #include <algorithm>
 #include <list>
 
-#include <list>
-
 #include "chunkserver/bgjobs.h"
 #include "chunkserver/hddspacemgr.h"
 #include "chunkserver/network_main_thread.h"
