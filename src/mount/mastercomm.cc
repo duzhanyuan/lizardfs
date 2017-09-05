@@ -106,8 +106,6 @@ static uint32_t masterip=0;
 static uint16_t masterport=0;
 static char srcstrip[17];
 static uint32_t srcip=0;
-static unsigned gIoRetries;
-static unsigned gReservedInodesPeriod;
 
 static uint8_t fterm;
 static std::atomic<bool> gIsKilled(false);
@@ -138,18 +136,32 @@ enum {
 
 static uint64_t *statsptr[STATNODES];
 
-struct connect_args_t {
-	char *bindhostname;
-	char *masterhostname;
-	char *masterportname;
-	uint8_t meta;
-	uint8_t clearpassword;
-	char *info;
-	char *subfolder;
-	uint8_t *passworddigest;
+struct InitParams {
+	std::string bind_host;
+	std::string host;
+	std::string port;
+	bool meta;
+	bool do_not_remember_password;
+	std::string mountpoint;
+	std::string subfolder;
+	std::vector<uint8_t> password_digest;
+	unsigned report_reserved_period;
+
+	InitParams &operator=(const LizardClient::FsInitParams &params) {
+		bind_host = params.bind_host;
+		host = params.host;
+		port = params.port;
+		meta = params.meta;
+		do_not_remember_password = params.do_not_remember_password;
+		mountpoint = params.mountpoint;
+		subfolder = params.subfolder;
+		password_digest = params.password_digest;
+		report_reserved_period = params.report_reserved_period;
+		return *this;
+	}
 };
 
-static struct connect_args_t connect_args;
+static InitParams gInitParams;
 
 void master_statsptr_init(void) {
 	void *s;
@@ -175,15 +187,6 @@ void master_stats_add(uint8_t id,uint64_t s) {
 		(*statsptr[id])+=s;
 		stats_unlock();
 	}
-}
-
-const char* errtab[]={LIZARDFS_ERROR_STRINGS};
-
-static inline const char* mfs_strerror(uint8_t status) {
-	if (status>LIZARDFS_ERROR_MAX) {
-		status=LIZARDFS_ERROR_MAX;
-	}
-	return errtab[status];
 }
 
 static inline void setDisconnect(bool value) {
@@ -422,37 +425,41 @@ bool fs_lizsendandreceive_any(threc *rec, MessageBuffer& messageData) {
 	return false;
 }
 
-int fs_resolve(uint8_t oninit,const char *bindhostname,const char *masterhostname,const char *masterportname) {
-	if (bindhostname) {
-		if (tcpresolve(bindhostname,NULL,&srcip,NULL,1)<0) {
-			if (oninit) {
-				fprintf(stderr,"can't resolve source hostname (%s)\n",bindhostname);
+int fs_resolve(bool verbose, const std::string &bindhostname, const std::string &masterhostname, const std::string &masterportname) {
+	if (!bindhostname.empty()) {
+		if (tcpresolve(bindhostname.c_str(), nullptr, &srcip, nullptr, 1) < 0) {
+			if (verbose) {
+				fprintf(stderr,"can't resolve source hostname (%s)\n", bindhostname.c_str());
 			} else {
-				lzfs_pretty_syslog(LOG_WARNING,"can't resolve source hostname (%s)",bindhostname);
+				lzfs_pretty_syslog(LOG_WARNING,"can't resolve source hostname (%s)", bindhostname.c_str());
 			}
 			return -1;
 		}
 	} else {
-		srcip=0;
+		srcip = 0;
 	}
-	snprintf(srcstrip,17,"%" PRIu32 ".%" PRIu32 ".%" PRIu32 ".%" PRIu32,(srcip>>24)&0xFF,(srcip>>16)&0xFF,(srcip>>8)&0xFF,srcip&0xFF);
-	srcstrip[16]=0;
+	snprintf(srcstrip, 17, "%" PRIu32 ".%" PRIu32 ".%" PRIu32 ".%" PRIu32,
+	         (srcip>>24)&0xFF, (srcip>>16)&0xFF, (srcip>>8)&0xFF, srcip&0xFF);
+	srcstrip[16] = 0;
 
-	if (tcpresolve(masterhostname,masterportname,&masterip,&masterport,0)<0) {
-		if (oninit) {
-			fprintf(stderr,"can't resolve master hostname and/or portname (%s:%s)\n",masterhostname,masterportname);
+	if (tcpresolve(masterhostname.c_str(), masterportname.c_str(), &masterip, &masterport, 0) < 0) {
+		if (verbose) {
+			fprintf(stderr, "can't resolve master hostname and/or portname (%s:%s)\n",
+			        masterhostname.c_str(), masterportname.c_str());
 		} else {
-			lzfs_pretty_syslog(LOG_WARNING,"can't resolve master hostname and/or portname (%s:%s)",masterhostname,masterportname);
+			lzfs_pretty_syslog(LOG_WARNING,"can't resolve master hostname and/or portname (%s:%s)",
+			                   masterhostname.c_str(), masterportname.c_str());
 		}
 		return -1;
 	}
-	snprintf(masterstrip,17,"%" PRIu32 ".%" PRIu32 ".%" PRIu32 ".%" PRIu32,(masterip>>24)&0xFF,(masterip>>16)&0xFF,(masterip>>8)&0xFF,masterip&0xFF);
-	masterstrip[16]=0;
+	snprintf(masterstrip, 17, "%" PRIu32 ".%" PRIu32 ".%" PRIu32 ".%" PRIu32,
+	        (masterip>>24)&0xFF, (masterip>>16)&0xFF, (masterip>>8)&0xFF, masterip&0xFF);
+	masterstrip[16] = 0;
 
 	return 0;
 }
 
-int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
+int fs_connect(bool verbose) {
 	uint32_t i,j;
 	uint8_t *wptr,*regbuff;
 	md5ctx ctx;
@@ -467,17 +474,17 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	const char *sesflagposstrtab[]={SESFLAG_POS_STRINGS};
 	const char *sesflagnegstrtab[]={SESFLAG_NEG_STRINGS};
 
-	if (fs_resolve(oninit,cargs->bindhostname,cargs->masterhostname,cargs->masterportname)<0) {
+	if (fs_resolve(verbose ,gInitParams.bind_host, gInitParams.host, gInitParams.port) < 0) {
 		return -1;
 	}
 
-	havepassword=(cargs->passworddigest==NULL)?0:1;
-	ileng=strlen(cargs->info)+1;
-	if (cargs->meta) {
+	havepassword = !gInitParams.password_digest.empty();
+	ileng=gInitParams.mountpoint.size() + 1;
+	if (gInitParams.meta) {
 		pleng=0;
 		regbuff = (uint8_t*) malloc(8+64+9+ileng+16);
 	} else {
-		pleng=strlen(cargs->subfolder)+1;
+		pleng=gInitParams.subfolder.size() + 1;
 		regbuff = (uint8_t*) malloc(8+64+13+pleng+ileng+16);
 	}
 
@@ -487,7 +494,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		return -1;
 	}
 	if (tcpnodelay(fd)<0) {
-		if (oninit) {
+		if (verbose) {
 			fprintf(stderr,"can't set TCP_NODELAY\n");
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"can't set TCP_NODELAY");
@@ -495,7 +502,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	}
 	if (srcip>0) {
 		if (tcpnumbind(fd,srcip,0)<0) {
-			if (oninit) {
+			if (verbose) {
 				fprintf(stderr,"can't bind socket to given ip (\"%s\")\n",srcstrip);
 			} else {
 				lzfs_pretty_syslog(LOG_WARNING,"can't bind socket to given ip (\"%s\")",srcstrip);
@@ -507,7 +514,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		}
 	}
 	if (tcpnumconnect(fd,masterip,masterport)<0) {
-		if (oninit) {
+		if (verbose) {
 			fprintf(stderr,"can't connect to mfsmaster (\"%s\":\"%" PRIu16 "\")\n",masterstrip,masterport);
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"can't connect to mfsmaster (\"%s\":\"%" PRIu16 "\")",masterstrip,masterport);
@@ -525,7 +532,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		wptr+=64;
 		put8bit(&wptr,REGISTER_GETRANDOM);
 		if (tcptowrite(fd,regbuff,8+65,1000)!=8+65) {
-			if (oninit) {
+			if (verbose) {
 				fprintf(stderr,"error sending data to mfsmaster\n");
 			} else {
 				lzfs_pretty_syslog(LOG_WARNING,"error sending data to mfsmaster");
@@ -536,7 +543,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 			return -1;
 		}
 		if (tcptoread(fd,regbuff,8,1000)!=8) {
-			if (oninit) {
+			if (verbose) {
 				fprintf(stderr,"error receiving data from mfsmaster\n");
 			} else {
 				lzfs_pretty_syslog(LOG_WARNING,"error receiving data from mfsmaster");
@@ -549,7 +556,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		rptr = regbuff;
 		i = get32bit(&rptr);
 		if (i!=MATOCL_FUSE_REGISTER) {
-			if (oninit) {
+			if (verbose) {
 				fprintf(stderr,"got incorrect answer from mfsmaster\n");
 			} else {
 				lzfs_pretty_syslog(LOG_WARNING,"got incorrect answer from mfsmaster");
@@ -561,7 +568,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		}
 		i = get32bit(&rptr);
 		if (i!=32) {
-			if (oninit) {
+			if (verbose) {
 				fprintf(stderr,"got incorrect answer from mfsmaster\n");
 			} else {
 				lzfs_pretty_syslog(LOG_WARNING,"got incorrect answer from mfsmaster");
@@ -572,7 +579,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 			return -1;
 		}
 		if (tcptoread(fd,regbuff,32,1000)!=32) {
-			if (oninit) {
+			if (verbose) {
 				fprintf(stderr,"error receiving data from mfsmaster\n");
 			} else {
 				lzfs_pretty_syslog(LOG_WARNING,"error receiving data from mfsmaster");
@@ -584,13 +591,13 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		}
 		md5_init(&ctx);
 		md5_update(&ctx,regbuff,16);
-		md5_update(&ctx,cargs->passworddigest,16);
+		md5_update(&ctx, gInitParams.password_digest.data(), gInitParams.password_digest.size());
 		md5_update(&ctx,regbuff+16,16);
 		md5_final(digest,&ctx);
 	}
 	wptr = regbuff;
 	put32bit(&wptr,CLTOMA_FUSE_REGISTER);
-	if (cargs->meta) {
+	if (gInitParams.meta) {
 		if (havepassword) {
 			put32bit(&wptr,64+9+ileng+16);
 		} else {
@@ -605,22 +612,22 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	}
 	memcpy(wptr,FUSE_REGISTER_BLOB_ACL,64);
 	wptr+=64;
-	put8bit(&wptr,(cargs->meta)?REGISTER_NEWMETASESSION:REGISTER_NEWSESSION);
+	put8bit(&wptr,(gInitParams.meta)?REGISTER_NEWMETASESSION:REGISTER_NEWSESSION);
 	put16bit(&wptr,LIZARDFS_PACKAGE_VERSION_MAJOR);
 	put8bit(&wptr,LIZARDFS_PACKAGE_VERSION_MINOR);
 	put8bit(&wptr,LIZARDFS_PACKAGE_VERSION_MICRO);
 	put32bit(&wptr,ileng);
-	memcpy(wptr,cargs->info,ileng);
+	memcpy(wptr,gInitParams.mountpoint.c_str(),ileng);
 	wptr+=ileng;
-	if (!cargs->meta) {
+	if (!gInitParams.meta) {
 		put32bit(&wptr,pleng);
-		memcpy(wptr,cargs->subfolder,pleng);
+		memcpy(wptr,gInitParams.subfolder.c_str(),pleng);
 	}
 	if (havepassword) {
 		memcpy(wptr+pleng,digest,16);
 	}
-	if (tcptowrite(fd,regbuff,8+64+(cargs->meta?9:13)+ileng+pleng+(havepassword?16:0),1000)!=(int32_t)(8+64+(cargs->meta?9:13)+ileng+pleng+(havepassword?16:0))) {
-		if (oninit) {
+	if (tcptowrite(fd,regbuff,8+64+(gInitParams.meta?9:13)+ileng+pleng+(havepassword?16:0),1000)!=(int32_t)(8+64+(gInitParams.meta?9:13)+ileng+pleng+(havepassword?16:0))) {
+		if (verbose) {
 			fprintf(stderr,"error sending data to mfsmaster: %s\n",strerr(tcpgetlasterror()));
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"error sending data to mfsmaster: %s",strerr(tcpgetlasterror()));
@@ -631,7 +638,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		return -1;
 	}
 	if (tcptoread(fd,regbuff,8,1000)!=8) {
-		if (oninit) {
+		if (verbose) {
 			fprintf(stderr,"error receiving data from mfsmaster: %s\n",strerr(tcpgetlasterror()));
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"error receiving data from mfsmaster: %s",strerr(tcpgetlasterror()));
@@ -644,7 +651,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	rptr = regbuff;
 	i = get32bit(&rptr);
 	if (i!=MATOCL_FUSE_REGISTER) {
-		if (oninit) {
+		if (verbose) {
 			fprintf(stderr,"got incorrect answer from mfsmaster\n");
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"got incorrect answer from mfsmaster");
@@ -655,8 +662,8 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		return -1;
 	}
 	i = get32bit(&rptr);
-	if (!(i==1 || (cargs->meta && (i==5 || i==9 || i==19)) || (cargs->meta==0 && (i==13 || i==21 || i==25 || i==35)))) {
-		if (oninit) {
+	if (!(i==1 || (gInitParams.meta && (i==5 || i==9 || i==19)) || (gInitParams.meta==0 && (i==13 || i==21 || i==25 || i==35)))) {
+		if (verbose) {
 			fprintf(stderr,"got incorrect answer from mfsmaster\n");
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"got incorrect answer from mfsmaster");
@@ -667,7 +674,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		return -1;
 	}
 	if (tcptoread(fd,regbuff,i,1000)!=(int32_t)i) {
-		if (oninit) {
+		if (verbose) {
 			fprintf(stderr,"error receiving data from mfsmaster: %s\n",strerr(tcpgetlasterror()));
 		} else {
 			lzfs_pretty_syslog(LOG_WARNING,"error receiving data from mfsmaster: %s",strerr(tcpgetlasterror()));
@@ -679,10 +686,10 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	}
 	rptr = regbuff;
 	if (i==1) {
-		if (oninit) {
-			fprintf(stderr,"mfsmaster register error: %s\n",mfs_strerror(rptr[0]));
+		if (verbose) {
+			fprintf(stderr,"mfsmaster register error: %s\n",lizardfs_error_string(rptr[0]));
 		} else {
-			lzfs_pretty_syslog(LOG_WARNING,"mfsmaster register error: %s",mfs_strerror(rptr[0]));
+			lzfs_pretty_syslog(LOG_WARNING,"mfsmaster register error: %s",lizardfs_error_string(rptr[0]));
 		}
 		tcpclose(fd);
 		fd=-1;
@@ -696,7 +703,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	}
 	sessionid = get32bit(&rptr);
 	sesflags = get8bit(&rptr);
-	if (!cargs->meta) {
+	if (!gInitParams.meta) {
 		rootuid = get32bit(&rptr);
 		rootgid = get32bit(&rptr);
 		if (i==21 || i==25 || i==35) {
@@ -725,15 +732,13 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 	}
 	free(regbuff);
 	lastwrite=time(NULL);
-	if (oninit==0) {
+	if (!verbose) {
 		lzfs_pretty_syslog(LOG_NOTICE,"registered to master with new session (id #%" PRIu32 ")", sessionid);
 	}
-	if (cargs->clearpassword && cargs->passworddigest!=NULL) {
-		memset(cargs->passworddigest,0,16);
-		free(cargs->passworddigest);
-		cargs->passworddigest = NULL;
+	if (gInitParams.do_not_remember_password) {
+		std::fill(gInitParams.password_digest.begin(), gInitParams.password_digest.end(), 0);
 	}
-	if (oninit==1) {
+	if (verbose) {
 		fprintf(stderr,"mfsmaster accepted connection with parameters: ");
 		j=0;
 		for (i=0 ; i<8 ; i++) {
@@ -748,7 +753,7 @@ int fs_connect(uint8_t oninit,struct connect_args_t *cargs) {
 		if (j==0) {
 			fprintf(stderr,"-");
 		}
-		if (!cargs->meta) {
+		if (!gInitParams.meta) {
 #ifndef _WIN32
 			struct passwd pwd,*pw;
 			struct group grp,*gr;
@@ -938,7 +943,7 @@ void fs_reconnect() {
 	rptr = regbuff;
 	if (rptr[0]!=0) {
 		sessionlost=1;
-		lzfs_pretty_syslog(LOG_WARNING,"master: register status: %s",mfs_strerror(rptr[0]));
+		lzfs_pretty_syslog(LOG_WARNING,"master: register status: %s",lizardfs_error_string(rptr[0]));
 		tcpclose(fd);
 		fd=-1;
 		return;
@@ -1012,7 +1017,7 @@ void* fs_nop_thread(void *arg) {
 				}
 				lastwrite=now;
 			}
-			if (++inodeswritecnt >= gReservedInodesPeriod) {
+			if (++inodeswritecnt >= gInitParams.report_reserved_period) {
 				inodeswritecnt = 0;
 				std::unique_lock<std::mutex> asLock(acquiredFileMutex);
 				inodesleng=8;
@@ -1116,11 +1121,11 @@ void* fs_receive_thread(void *) {
 		}
 		if (fd==-1) {   // still not connected
 			if (sessionlost) {      // if previous session is lost then try to register as a new session
-				if (fs_connect(0,&connect_args)==0) {
+				if (fs_connect(false)==0) {
 					sessionlost=0;
 				}
 			} else {        // if other problem occurred then try to resolve hostname and portname then try to reconnect using the same session id
-				if (fs_resolve(0,connect_args.bindhostname,connect_args.masterhostname,connect_args.masterportname)==0) {
+				if (fs_resolve(false, gInitParams.bind_host, gInitParams.host, gInitParams.port) == 0) {
 					fs_reconnect();
 				}
 			}
@@ -1224,42 +1229,21 @@ void* fs_receive_thread(void *) {
 }
 
 // called before fork
-int fs_init_master_connection(const char *bindhostname, const char *masterhostname,
-		const char *masterportname, uint8_t meta, const char *info, const char *subfolder,
-		const uint8_t passworddigest[16], uint8_t donotrememberpassword, uint8_t bgregister,
-		unsigned retries, unsigned reportreservedperiod) {
+int fs_init_master_connection(LizardClient::FsInitParams &params) {
 	master_statsptr_init();
 
-	gIoRetries = retries;
-	gReservedInodesPeriod = reportreservedperiod;
+	gInitParams = params;
+	std::fill(params.password_digest.begin(), params.password_digest.end(), 0);
 
 	fd = -1;
-	sessionlost = bgregister;
+	sessionlost = params.delayed_init;
 	sessionid = 0;
 	disconnect = false;
 
-	if (bindhostname) {
-		connect_args.bindhostname = strdup(bindhostname);
-	} else {
-		connect_args.bindhostname = NULL;
-	}
-	connect_args.masterhostname = strdup(masterhostname);
-	connect_args.masterportname = strdup(masterportname);
-	connect_args.meta = meta;
-	connect_args.clearpassword = donotrememberpassword;
-	connect_args.info = strdup(info);
-	connect_args.subfolder = strdup(subfolder);
-	if (passworddigest==NULL) {
-		connect_args.passworddigest = NULL;
-	} else {
-		connect_args.passworddigest = (uint8_t*) malloc(16);
-		memcpy(connect_args.passworddigest,passworddigest,16);
-	}
-
-	if (bgregister) {
+	if (params.delayed_init) {
 		return 1;
 	}
-	return fs_connect(1,&connect_args);
+	return fs_connect(params.verbose);
 }
 
 // called after fork
@@ -1278,33 +1262,30 @@ void fs_init_threads(uint32_t retries) {
 void fs_term(void) {
 	threc *tr,*trn;
 	acquired_file *af,*afn;
-	std::unique_lock<std::mutex> fdLock(fdMutex);
+	std::unique_lock<std::mutex> fd_lock(fdMutex);
 	fterm = 1;
-	fdLock.unlock();
+	fd_lock.unlock();
 	pthread_join(npthid,NULL);
 	pthread_join(rpthid,NULL);
+	std::unique_lock<std::mutex> rec_lock(recMutex);
 	for (tr = threchead ; tr ; tr = trn) {
 		trn = tr->next;
 		tr->outputBuffer.clear();
 		tr->inputBuffer.clear();
 		delete tr;
 	}
+	threchead = nullptr;
+	rec_lock.unlock();
+	std::unique_lock<std::mutex> af_lock(acquiredFileMutex);
 	for (af = afhead ; af ; af = afn) {
 		afn = af->next;
 		free(af);
 	}
+	afhead = nullptr;
+	af_lock.unlock();
+	fd_lock.lock();
 	if (fd>=0) {
 		tcpclose(fd);
-	}
-	if (connect_args.bindhostname) {
-		free(connect_args.bindhostname);
-	}
-	free(connect_args.masterhostname);
-	free(connect_args.masterportname);
-	free(connect_args.info);
-	free(connect_args.subfolder);
-	if (connect_args.passworddigest) {
-		free(connect_args.passworddigest);
 	}
 }
 
@@ -1368,43 +1349,9 @@ uint8_t fs_access(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t modemask) {
 	return ret;
 }
 
-uint8_t fs_lookup(uint32_t parent, uint8_t nleng, const uint8_t *name, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
-	uint8_t *wptr;
-	const uint8_t *rptr;
-	uint32_t i;
-	uint32_t t32;
-	uint8_t ret;
+uint8_t fs_lookup(uint32_t parent, const std::string &path, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
 	threc *rec = fs_get_my_threc();
-	wptr = fs_createpacket(rec,CLTOMA_FUSE_LOOKUP,13+nleng);
-	if (wptr==NULL) {
-		return LIZARDFS_ERROR_IO;
-	}
-	put32bit(&wptr,parent);
-	put8bit(&wptr,nleng);
-	memcpy(wptr,name,nleng);
-	wptr+=nleng;
-	put32bit(&wptr,uid);
-	put32bit(&wptr,gid);
-	rptr = fs_sendandreceive(rec,MATOCL_FUSE_LOOKUP,&i);
-	if (rptr==NULL) {
-		ret = LIZARDFS_ERROR_IO;
-	} else if (i==1) {
-		ret = rptr[0];
-	} else if (i!=39) {
-		setDisconnect(true);
-		ret = LIZARDFS_ERROR_IO;
-	} else {
-		t32 = get32bit(&rptr);
-		*inode = t32;
-		memcpy(attr.data(), rptr, attr.size());
-		ret = LIZARDFS_STATUS_OK;
-	}
-	return ret;
-}
-
-uint8_t fs_whole_path_lookup(uint32_t parent, const std::string &name, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr) {
-	threc *rec = fs_get_my_threc();
-	auto message = cltoma::wholePathLookup::build(rec->packetId, parent, name, uid, gid);
+	auto message = cltoma::wholePathLookup::build(rec->packetId, parent, path, uid, gid);
 	if (!fs_lizcreatepacket(rec, message)) {
 		return LIZARDFS_ERROR_IO;
 	}
@@ -2325,6 +2272,50 @@ uint8_t fs_gettrash(const uint8_t **dbuff,uint32_t *dbuffsize) {
 	return ret;
 }
 
+uint8_t fs_getreserved(LizardClient::NamedInodeOffset off, LizardClient::NamedInodeOffset max_entries,
+	               std::vector<NamedInodeEntry> &entries) {
+	threc *rec = fs_get_my_threc();
+	auto message = cltoma::fuseGetReserved::build(rec->packetId, off, max_entries);
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_GETRESERVED, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	try {
+		PacketVersion dummy_packet_version;
+		uint32_t dummy_message_id;
+		deserializePacketVersionNoHeader(message, dummy_packet_version);
+		matocl::fuseGetReserved::deserialize(message, dummy_message_id, entries);
+		return LIZARDFS_STATUS_OK;
+	} catch (Exception &ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_GETRESERVED", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_gettrash(LizardClient::NamedInodeOffset off, LizardClient::NamedInodeOffset max_entries,
+	            std::vector<NamedInodeEntry> &entries) {
+	threc *rec = fs_get_my_threc();
+	auto message = cltoma::fuseGetTrash::build(rec->packetId, off, max_entries);
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_GETTRASH, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	try {
+		PacketVersion dummy_packet_version;
+		uint32_t dummy_message_id;
+		deserializePacketVersionNoHeader(message, dummy_packet_version);
+		matocl::fuseGetTrash::deserialize(message, dummy_message_id, entries);
+		return LIZARDFS_STATUS_OK;
+	} catch (Exception &ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_GETTRASH", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
 uint8_t fs_getdetachedattr(uint32_t inode, Attributes &attr) {
 	uint8_t *wptr;
 	const uint8_t *rptr;
@@ -2632,9 +2623,9 @@ uint8_t fs_deletacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type) {
 	}
 }
 
-uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, AccessControlList& acl) {
+uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, RichACL& acl, uint32_t &owner_id) {
 	threc* rec = fs_get_my_threc();
-	auto message = cltoma::fuseGetAcl::build(rec->packetId, inode, uid, gid, type);
+	auto message = cltoma::fuseGetAcl::build(rec->packetId, inode, uid, gid, AclType::kRichACL);
 	if (!fs_lizcreatepacket(rec, message)) {
 		return LIZARDFS_ERROR_IO;
 	}
@@ -2646,8 +2637,8 @@ uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, Acce
 		deserializePacketVersionNoHeader(message, packetVersion);
 		if (packetVersion == matocl::fuseGetAcl::kStatusPacketVersion) {
 			uint8_t status;
-			uint32_t dummyMessageId;
-			matocl::fuseGetAcl::deserialize(message.data(), message.size(), dummyMessageId,
+			uint32_t dummy_msg_id;
+			matocl::fuseGetAcl::deserialize(message.data(), message.size(), dummy_msg_id,
 					status);
 			if (status == LIZARDFS_STATUS_OK) {
 				fs_got_inconsistent("LIZ_MATOCL_GET_ACL", message.size(),
@@ -2655,9 +2646,9 @@ uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, Acce
 				return LIZARDFS_ERROR_IO;
 			}
 			return status;
-		} else if (packetVersion == matocl::fuseGetAcl::kResponsePacketVersion) {
-			uint32_t dummyMessageId;
-			matocl::fuseGetAcl::deserialize(message.data(), message.size(), dummyMessageId, acl);
+		} else if (packetVersion == matocl::fuseGetAcl::kRichACLResponsePacketVersion) {
+			uint32_t dummy_msg_id;
+			matocl::fuseGetAcl::deserialize(message.data(), message.size(), dummy_msg_id, owner_id, acl);
 			return LIZARDFS_STATUS_OK;
 		} else {
 			fs_got_inconsistent("LIZ_MATOCL_GET_ACL", message.size(),
@@ -2666,6 +2657,26 @@ uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, Acce
 		}
 	} catch (Exception& ex) {
 		fs_got_inconsistent("LIZ_MATOCL_GET_ACL", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_setacl(uint32_t inode, uint32_t uid, uint32_t gid, const RichACL& acl) {
+	threc* rec = fs_get_my_threc();
+	auto message = cltoma::fuseSetAcl::build(rec->packetId, inode, uid, gid, acl);
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_SET_ACL, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	try {
+		uint8_t status;
+		uint32_t dummy_msg_id;
+		matocl::fuseSetAcl::deserialize(message.data(), message.size(), dummy_msg_id, status);
+		return status;
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_SET_ACL", message.size(), ex.what());
 		return LIZARDFS_ERROR_IO;
 	}
 }
@@ -2681,8 +2692,8 @@ uint8_t fs_setacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, cons
 	}
 	try {
 		uint8_t status;
-		uint32_t dummyMessageId;
-		matocl::fuseSetAcl::deserialize(message.data(), message.size(), dummyMessageId, status);
+		uint32_t dummy_msg_id;
+		matocl::fuseSetAcl::deserialize(message.data(), message.size(), dummy_msg_id, status);
 		return status;
 	} catch (Exception& ex) {
 		fs_got_inconsistent("LIZ_MATOCL_SET_ACL", message.size(), ex.what());
@@ -2813,18 +2824,22 @@ uint8_t fs_getlk(uint32_t inode, uint64_t owner, lzfs_locks::FlockWrapper &lock)
 	}
 
 	try {
-		PacketVersion packetVersion;
-		deserializePacketVersionNoHeader(message, packetVersion);
-		if (packetVersion == 0) {
+		PacketVersion packet_version;
+		deserializePacketVersionNoHeader(message, packet_version);
+		if (packet_version == matocl::fuseGetlk::kStatusPacketVersion) {
 			uint8_t status;
-			uint32_t dummyMessageId;
-			matocl::fuseGetlk::deserialize(message, dummyMessageId, status);
+			uint32_t message_id;
+			matocl::fuseGetlk::deserialize(message, message_id, status);
 			return status;
+		} else if (packet_version == matocl::fuseGetlk::kResponsePacketVersion) {
+			uint32_t message_id;
+			matocl::fuseGetlk::deserialize(message, message_id, lock);
+			return LIZARDFS_STATUS_OK;
 		} else {
 			fs_got_inconsistent(
 				"LIZ_MATOCL_GETLK",
 				message.size(),
-				"unknown version " + std::to_string(packetVersion));
+				"unknown version " + std::to_string(packet_version));
 			return LIZARDFS_ERROR_IO;
 		}
 	} catch (Exception& ex) {
@@ -2921,4 +2936,179 @@ uint8_t fs_flock_recv() {
 		fs_got_inconsistent("LIZ_MATOCL_FLOCK", message.size(), ex.what());
 		return LIZARDFS_ERROR_IO;
 	}
+}
+
+uint8_t fs_makesnapshot(uint32_t src_inode, uint32_t dst_inode, const std::string &dst_parent,
+	                uint32_t uid, uint32_t gid, uint8_t can_overwrite, LizardClient::JobId &job_id) {
+	static const int kBatchSize = 1024;
+	threc *rec = fs_get_my_threc();
+	job_id = 0;
+
+	uint32_t msg_id;
+	MessageBuffer response;
+	auto request = cltoma::requestTaskId::build(rec->packetId);
+	if (!fs_lizcreatepacket(rec, request)) {
+		return LIZARDFS_ERROR_IO;
+	}
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_REQUEST_TASK_ID, response)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	try {
+		matocl::requestTaskId::deserialize(response, msg_id, job_id);
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_REQUEST_TASK_ID", request.size(), ex.what());
+		job_id = 0;
+		return LIZARDFS_ERROR_IO;
+	}
+
+	request = cltoma::snapshot::build(rec->packetId, job_id, src_inode, dst_inode, dst_parent,
+	                                  uid, gid, can_overwrite, true, kBatchSize);
+
+	if (!fs_lizcreatepacket(rec, request)) {
+		job_id = 0;
+		return LIZARDFS_ERROR_IO;
+	}
+
+	response.clear();
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_SNAPSHOT, response)) {
+		job_id = 0;
+		return LIZARDFS_ERROR_IO;
+	}
+
+	try {
+		uint8_t status;
+		matocl::snapshot::deserialize(response, msg_id, status);
+		return status;
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_SNAPSHOT", request.size(), ex.what());
+		job_id = 0;
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_getgoal(uint32_t inode, std::string &goal) {
+	threc *rec = fs_get_my_threc();
+
+	goal.clear();
+	auto message = cltoma::fuseGetGoal::build(rec->packetId, inode, GMODE_NORMAL);
+
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_GETGOAL, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	try {
+		PacketVersion packet_version;
+		deserializePacketVersionNoHeader(message, packet_version);
+		if (packet_version == matocl::fuseGetGoal::kStatusPacketVersion) {
+			uint8_t status;
+			uint32_t dummy_message_id;
+			matocl::fuseGetGoal::deserialize(message, dummy_message_id, status);
+			return status;
+		} else if (packet_version == matocl::fuseGetGoal::kResponsePacketVersion) {
+			std::vector<FuseGetGoalStats> goalsStats;
+			uint32_t messageId;
+			matocl::fuseGetGoal::deserialize(message, messageId, goalsStats);
+			if (goalsStats.size() != 1) {
+				return LIZARDFS_ERROR_EINVAL;
+			}
+			goal = goalsStats[0].goalName;
+			return LIZARDFS_STATUS_OK;
+		} else {
+			return LIZARDFS_ERROR_EINVAL;
+		}
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_GETGOAL", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_setgoal(uint32_t inode, uint32_t uid, const std::string &goal_name, uint8_t smode) {
+	threc *rec = fs_get_my_threc();
+
+	auto message = cltoma::fuseSetGoal::build(rec->packetId, inode, uid, goal_name, smode);
+
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_FUSE_SETGOAL, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	try {
+		PacketVersion packet_version;
+		deserializePacketVersionNoHeader(message, packet_version);
+		if (packet_version == matocl::fuseSetGoal::kStatusPacketVersion) {
+			uint8_t status;
+			uint32_t dummy_message_id;
+			matocl::fuseSetGoal::deserialize(message, dummy_message_id, status);
+			return status;
+		} else if (packet_version == matocl::fuseSetGoal::kResponsePacketVersion) {
+			return LIZARDFS_STATUS_OK;
+		} else {
+			return LIZARDFS_ERROR_EINVAL;
+		}
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_FUSE_SETGOAL", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_getchunksinfo(uint32_t uid, uint32_t gid, uint32_t inode, uint32_t chunk_index,
+		uint32_t chunk_count, std::vector<ChunkWithAddressAndLabel> &chunks) {
+	threc *rec = fs_get_my_threc();
+
+	auto message = cltoma::chunksInfo::build(rec->packetId, uid, gid, inode, chunk_index, chunk_count);
+
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_CHUNKS_INFO, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	try {
+		PacketVersion packet_version;
+		deserializePacketVersionNoHeader(message, packet_version);
+		if (packet_version == matocl::fuseSetGoal::kStatusPacketVersion) {
+			uint8_t status;
+			uint32_t message_id;
+			matocl::chunksInfo::deserialize(message, message_id, status);
+			return status;
+		} else if (packet_version == matocl::fuseSetGoal::kResponsePacketVersion) {
+			uint32_t message_id;
+			matocl::chunksInfo::deserialize(message, message_id, chunks);
+			return LIZARDFS_STATUS_OK;
+		} else {
+			return LIZARDFS_ERROR_EINVAL;
+		}
+	} catch (Exception& ex) {
+		fs_got_inconsistent("LIZ_MATOCL_CHUNKS_INFO", message.size(), ex.what());
+		return LIZARDFS_ERROR_IO;
+	}
+}
+
+uint8_t fs_getchunkservers(std::vector<ChunkserverListEntry> &chunkservers) {
+	threc *rec = fs_get_my_threc();
+	uint32_t message_id;
+
+	auto message = cltoma::cservList::build(rec->packetId, true);
+
+	if (!fs_lizcreatepacket(rec, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	if (!fs_lizsendandreceive(rec, LIZ_MATOCL_CSERV_LIST, message)) {
+		return LIZARDFS_ERROR_IO;
+	}
+
+	chunkservers.clear();
+	matocl::cservList::deserialize(message, message_id, chunkservers);
+	return LIZARDFS_STATUS_OK;
 }

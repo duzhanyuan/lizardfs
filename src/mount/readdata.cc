@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2016 Skytechnology sp. z o.o..
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2017 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS.
 
@@ -35,7 +35,7 @@
 
 #include "common/connection_pool.h"
 #include "common/datapack.h"
-#include "protocol/MFSCommunication.h"
+#include "common/exceptions.h"
 #include "common/mfserr.h"
 #include "common/read_plan_executor.h"
 #include "common/slogger.h"
@@ -43,11 +43,11 @@
 #include "common/time_utils.h"
 #include "mount/chunk_locator.h"
 #include "mount/chunk_reader.h"
-#include "mount/exceptions.h"
 #include "mount/mastercomm.h"
 #include "mount/readahead_adviser.h"
 #include "mount/readdata_cache.h"
 #include "mount/tweaks.h"
+#include "protocol/MFSCommunication.h"
 
 #define USECTICK 333333
 #define REFRESHTICKS 15
@@ -322,9 +322,9 @@ static int read_to_buffer(readrec *rrec, uint64_t current_offset, uint64_t bytes
 		} catch (UnrecoverableReadException &ex) {
 			print_error_msg(rrec, try_counter, ex);
 			if (ex.status() == LIZARDFS_ERROR_ENOENT) {
-				return EBADF; // stale handle
+				return LIZARDFS_ERROR_EBADF; // stale handle
 			} else {
-				return EIO;
+				return LIZARDFS_ERROR_IO;
 			}
 		} catch (Exception &ex) {
 			if (try_counter > 0) {
@@ -332,7 +332,7 @@ static int read_to_buffer(readrec *rrec, uint64_t current_offset, uint64_t bytes
 			}
 			force_prepare = true;
 			if (try_counter > maxRetries) {
-				return EIO;
+				return LIZARDFS_ERROR_IO;
 			} else {
 				usleep(sleep_timeout.remaining_us());
 				sleep_time_ms = read_data_sleep_time_ms(try_counter);
@@ -340,7 +340,7 @@ static int read_to_buffer(readrec *rrec, uint64_t current_offset, uint64_t bytes
 			try_counter++;
 		}
 	}
-	return 0;
+	return LIZARDFS_STATUS_OK;
 }
 
 int read_data(void *rr, uint64_t offset, uint32_t size, ReadCache::Result &ret) {
@@ -349,7 +349,7 @@ int read_data(void *rr, uint64_t offset, uint32_t size, ReadCache::Result &ret) 
 	assert(offset % MFSBLOCKSIZE == 0);
 
 	if (size == 0) {
-		return 0;
+		return LIZARDFS_STATUS_OK;
 	}
 
 	rrec->readahead_adviser.feed(offset, size);
@@ -358,7 +358,7 @@ int read_data(void *rr, uint64_t offset, uint32_t size, ReadCache::Result &ret) 
 
 	if (result.frontOffset() <= offset && offset + size <= result.endOffset()) {
 		ret = std::move(result);
-		return 0;
+		return LIZARDFS_STATUS_OK;
 	}
 	uint64_t request_offset = result.remainingOffset();
 	uint64_t bytes_to_read_left = std::max<uint64_t>(size, rrec->readahead_adviser.window()) - (request_offset - offset);
@@ -373,5 +373,5 @@ int read_data(void *rr, uint64_t offset, uint32_t size, ReadCache::Result &ret) 
 	}
 
 	ret = std::move(result);
-	return 0;
+	return LIZARDFS_STATUS_OK;
 }

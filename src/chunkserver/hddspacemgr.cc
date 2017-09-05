@@ -77,7 +77,6 @@
 #include "common/disk_info.h"
 #include "common/exceptions.h"
 #include "common/event_loop.h"
-#include "common/list.h"
 #include "common/massert.h"
 #include "common/moosefs_vector.h"
 #include "common/random.h"
@@ -758,50 +757,19 @@ static void hdd_chunk_testmove(Chunk *c) {
 // no locks - locked by caller
 static inline void hdd_refresh_usage(folder *f) {
 	TRACETHIS();
-	if (f->sizelimit) {
-		uint32_t knownblocks;
-		uint32_t knowncount;
-		uint64_t calcsize;
-		Chunk *c;
-		knownblocks = 0;
-		knowncount = 0;
-		{
-			std::lock_guard<std::mutex> hashlock_guard(hashlock);
-			std::lock_guard<std::mutex> testlock_guard(testlock);
-			for (c=f->testhead ; c ; c=c->testnext) {
-				if (c->state==CH_AVAIL && c->validattr==1) {
-					knowncount++;
-					knownblocks+=c->blocks;
-				}
-			}
-		}
-		if (knowncount>0) {
-			calcsize = knownblocks;
-			calcsize *= f->chunkcount;
-			calcsize /= knowncount;
-			// now calcsize is an estimated number of blocks, calculate number of bytes
-			calcsize *= MFSBLOCKSIZE;
-			calcsize += static_cast<uint64_t>(f->chunkcount) * MFSHDRSIZE;
-		} else { // unknown result;
-			calcsize = 0;
-		}
-		f->total = f->sizelimit;
-		f->avail = (calcsize>f->sizelimit)?0:f->sizelimit-calcsize;
-	} else {
-		struct statvfs fsinfo;
+	struct statvfs fsinfo;
 
-		if (statvfs(f->path,&fsinfo)<0) {
-			f->avail = 0ULL;
-			f->total = 0ULL;
-			return;
-		}
-		f->avail = (uint64_t)(fsinfo.f_frsize)*(uint64_t)(fsinfo.f_bavail);
-		f->total = (uint64_t)(fsinfo.f_frsize)*(uint64_t)(fsinfo.f_blocks-(fsinfo.f_bfree-fsinfo.f_bavail));
-		if (f->avail < f->leavefree) {
-			f->avail = 0ULL;
-		} else {
-			f->avail -= f->leavefree;
-		}
+	if (statvfs(f->path,&fsinfo)<0) {
+		f->avail = 0ULL;
+		f->total = 0ULL;
+		return;
+	}
+	f->avail = (uint64_t)(fsinfo.f_frsize)*(uint64_t)(fsinfo.f_bavail);
+	f->total = (uint64_t)(fsinfo.f_frsize)*(uint64_t)(fsinfo.f_blocks-(fsinfo.f_bfree-fsinfo.f_bavail));
+	if (f->avail < f->leavefree) {
+		f->avail = 0ULL;
+	} else {
+		f->avail -= f->leavefree;
 	}
 }
 
@@ -1560,7 +1528,7 @@ int hdd_prefetch_blocks(uint64_t chunkid, ChunkPartType chunk_type, uint32_t fir
 	int status = hdd_open(c);
 	if (status != LIZARDFS_STATUS_OK) {
 		lzfs_pretty_syslog(LOG_WARNING, "error opening chunk for prefetching: %" PRIu64 " - %s",
-				chunkid, mfsstrerr(status));
+				chunkid, lizardfs_error_string(status));
 		hdd_chunk_release(c);
 		return status;
 	}
@@ -1574,7 +1542,7 @@ int hdd_prefetch_blocks(uint64_t chunkid, ChunkPartType chunk_type, uint32_t fir
 	status = hdd_close(c);
 	if (status != LIZARDFS_STATUS_OK) {
 		lzfs_pretty_syslog(LOG_WARNING, "error closing prefetched chunk: %" PRIu64 " - %s",
-				chunkid, mfsstrerr(status));
+				chunkid, lizardfs_error_string(status));
 	}
 
 	hdd_chunk_release(c);
@@ -3064,7 +3032,7 @@ static inline void hdd_add_chunk(folder *f,
  */
 void hdd_folder_scan_layout(folder *f, uint32_t begin_time, int layout_version) {
 	DIR *dd;
-	struct dirent *de, *destorage;
+	struct dirent *de;
 	uint32_t tcheckcnt;
 	uint8_t lastperc, currentperc;
 	uint32_t lasttime, currenttime;
@@ -3075,10 +3043,6 @@ void hdd_folder_scan_layout(folder *f, uint32_t begin_time, int layout_version) 
 	if (scan_state == SCST_SCANTERMINATE) {
 		return;
 	}
-
-	/* size of name added to size of structure because on some os'es d_name has size of 1 byte */
-	std::vector<uint8_t> buffer(sizeof(struct dirent) + pathconf(f->path, _PC_NAME_MAX) + 1);
-	destorage = reinterpret_cast<struct dirent *>(buffer.data());
 
 	bool scanterm = false;
 	tcheckcnt = 0;
@@ -3093,7 +3057,12 @@ void hdd_folder_scan_layout(folder *f, uint32_t begin_time, int layout_version) 
 			continue;
 		}
 
-		while (readdir_r(dd, destorage, &de) == 0 && de != NULL && !scanterm) {
+		while (!scanterm) {
+			de = readdir(dd);
+			if (!de) {
+				break;
+			}
+
 			ChunkFilenameParser filenameParser(de->d_name);
 			if (filenameParser.parse() != ChunkFilenameParser::Status::OK) {
 				if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) {
@@ -3148,7 +3117,7 @@ void hdd_folder_scan_layout(folder *f, uint32_t begin_time, int layout_version) 
  */
 int64_t hdd_folder_migrate_directories(folder *f, int layout_version) {
 	DIR *dd;
-	struct dirent *de, *destorage;
+	struct dirent *de;
 	int64_t count = 0;
 
 	assert(layout_version > 0);
@@ -3159,10 +3128,6 @@ int64_t hdd_folder_migrate_directories(folder *f, int layout_version) {
 			return count;
 		}
 	}
-
-	/* size of name added to size of structure because on some os'es d_name has size of 1 byte */
-	std::vector<uint8_t> buffer(sizeof(struct dirent) + pathconf(f->path, _PC_NAME_MAX) + 1);
-	destorage = reinterpret_cast<struct dirent *>(buffer.data());
 
 	bool scan_term = false;
 	int check_cnt = 0;
@@ -3175,7 +3140,12 @@ int64_t hdd_folder_migrate_directories(folder *f, int layout_version) {
 			continue;
 		}
 
-		while (readdir_r(dd, destorage, &de) == 0 && de != NULL && !scan_term) {
+		while (!scan_term) {
+			de = readdir(dd);
+			if (!de) {
+				break;
+			}
+
 			ChunkFilenameParser filenameParser(de->d_name);
 			if (filenameParser.parse() != ChunkFilenameParser::Status::OK) {
 				continue;
@@ -3514,14 +3484,12 @@ int hdd_size_parse(const char *str,uint64_t *ret) {
 
 int hdd_parseline(char *hddcfgline) {
 	TRACETHIS();
-	uint32_t l,p;
+	uint32_t l;
 	int damaged,lfd,td;
 	char *pptr;
 	struct stat sb;
 	folder *f;
 	uint8_t lockneeded;
-	uint64_t limit;
-	uint8_t lmode;
 
 	damaged = 0;
 	if (hddcfgline[0]=='#') {
@@ -3533,31 +3501,6 @@ int hdd_parseline(char *hddcfgline) {
 	}
 	if (l==0) {
 		return 0;
-	}
-	p = l;
-	while (p>0 && hddcfgline[p-1]!=' ' && hddcfgline[p-1]!='\t') {
-		p--;
-	}
-	lmode = 0;
-	if (p>0) {
-		if (hddcfgline[p]=='-') {
-			if (hdd_size_parse(hddcfgline+p+1,&limit)>=0) {
-				lmode = 1;
-			}
-		} if ((hddcfgline[p]>='0' && hddcfgline[p]<='9') || hddcfgline[p]=='.') {
-			if (hdd_size_parse(hddcfgline+p,&limit)>=0) {
-				lmode = 2;
-			}
-		}
-		if (lmode) {
-			l = p;
-			while (l>0 && (hddcfgline[l-1]==' ' || hddcfgline[l-1]=='\t')) {
-				l--;
-			}
-			if (l==0) {
-				return 0;
-			}
-		}
 	}
 	if (hddcfgline[l-1]!='/') {
 		hddcfgline[l]='/';
@@ -3580,41 +3523,6 @@ int hdd_parseline(char *hddcfgline) {
 		for (f=folderhead ; f && lockneeded ; f=f->next) {
 			if (strcmp(f->path,pptr)==0) {
 				lockneeded = 0;
-			}
-		}
-	}
-
-	if (lmode==1) { // sanity checks
-		if (limit<0x4000000) {
-			lzfs_pretty_syslog(LOG_WARNING,"hdd space manager: limit on '%s' < chunk size - leaving so small space on hdd is not recommended",pptr);
-		} else {
-			struct statvfs fsinfo;
-
-			if (statvfs(pptr,&fsinfo)<0) {
-				lzfs_pretty_errlog(LOG_NOTICE,"hdd space manager: statvfs on '%s'",pptr);
-			} else {
-				uint64_t size = (uint64_t)(fsinfo.f_frsize)*(uint64_t)(fsinfo.f_blocks-(fsinfo.f_bfree-fsinfo.f_bavail));
-				if (limit > size) {
-					lzfs_pretty_syslog(LOG_WARNING,"hdd space manager: space to be left free on '%s' (%" PRIu64 ") is greater than real volume size (%" PRIu64 ")",pptr,limit,size);
-				}
-			}
-		}
-	}
-	if (lmode==2) { // sanity checks
-		if (limit==0) {
-			lzfs_pretty_syslog(LOG_WARNING,"hdd space manager: limit on '%s' set to zero - using real volume size",pptr);
-			lmode = 0;
-		} else {
-			struct statvfs fsinfo;
-
-			if (statvfs(pptr,&fsinfo)<0) {
-				lzfs_pretty_errlog(LOG_NOTICE,"hdd space manager: statvfs on '%s'",pptr);
-			} else {
-				uint64_t size = (uint64_t)(fsinfo.f_frsize)*(uint64_t)(fsinfo.f_blocks-(fsinfo.f_bfree-fsinfo.f_bavail));
-				if (limit > size) {
-					lzfs_pretty_syslog(LOG_WARNING,"hdd space manager: limit on '%s' (%" PRIu64 ") is greater than real volume size (%" PRIu64 ") - using real volume size",pptr,limit,size);
-					lmode = 0;
-				}
 			}
 		}
 	}
@@ -3674,16 +3582,7 @@ int hdd_parseline(char *hddcfgline) {
 				f->damaged = damaged;
 				f->avail = 0ULL;
 				f->total = 0ULL;
-				if (lmode==1) {
-					f->leavefree = limit;
-				} else {
-					f->leavefree = gLeaveFree;
-				}
-				if (lmode==2) {
-					f->sizelimit = limit;
-				} else {
-					f->sizelimit = 0;
-				}
+				f->leavefree = gLeaveFree;
 				f->chunkcount = 0;
 				f->cstat.clear();
 				for (l=0 ; l<STATSHISTORY ; l++) {
@@ -3721,16 +3620,7 @@ int hdd_parseline(char *hddcfgline) {
 	f->path = strdup(pptr);
 	passert(f->path);
 	f->toremove = 0;
-	if (lmode==1) {
-		f->leavefree = limit;
-	} else {
-		f->leavefree = gLeaveFree;
-	}
-	if (lmode==2) {
-		f->sizelimit = limit;
-	} else {
-		f->sizelimit = 0;
-	}
+	f->leavefree = gLeaveFree;
 	f->avail = 0ULL;
 	f->total = 0ULL;
 	f->chunkcount = 0;

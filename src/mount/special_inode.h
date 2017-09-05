@@ -75,11 +75,11 @@ LizardClient::EntryParam special_lookup(LizardClient::Inode ino, const LizardCli
 	                                LizardClient::Inode parent, const char *name, char attrstr[256]);
 
 LizardClient::AttrReply special_getattr(LizardClient::Inode ino, const LizardClient::Context &ctx,
-	                                LizardClient::FileInfo *fi, char attrstr[256]);
+	                                char (&attrstr)[256]);
 
 LizardClient::AttrReply special_setattr(LizardClient::Inode ino, const LizardClient::Context &ctx, struct stat *stbuf,
-	                                int to_set, LizardClient::FileInfo *fi, char modestr[11], char attrstr[256]);
+	                                int to_set, char modestr[11], char attrstr[256]);
 
 void special_open(LizardClient::Inode ino, const LizardClient::Context &ctx, LizardClient::FileInfo *fi);
 
-void special_release(LizardClient::Inode ino, const LizardClient::Context &ctx, LizardClient::FileInfo *fi);
+void special_release(LizardClient::Inode ino, LizardClient::FileInfo *fi);

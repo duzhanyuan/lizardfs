@@ -27,6 +27,8 @@
 #  include "common/platform.h"
 #endif
 
+#include "common/lizardfs_error_codes.h"
+
 #define MSB_1 0
 #define MSB_2 1
 #define MSB_4 2
@@ -84,117 +86,6 @@
 #define MFS_MAX_FILE_SIZE (((uint64_t)(MFSCHUNKSIZE))<<31)
 
 #define MFS_INODE_REUSE_DELAY 86400
-
-/// field values: status
-#define LIZARDFS_STATUS_OK                      0    // OK
-#define LIZARDFS_ERROR_EPERM                    1    // Operation not permitted
-#define LIZARDFS_ERROR_ENOTDIR                  2    // Not a directory
-#define LIZARDFS_ERROR_ENOENT                   3    // No such file or directory
-#define LIZARDFS_ERROR_EACCES                   4    // Permission denied
-#define LIZARDFS_ERROR_EEXIST                   5    // File exists
-#define LIZARDFS_ERROR_EINVAL                   6    // Invalid argument
-#define LIZARDFS_ERROR_ENOTEMPTY                7    // Directory not empty
-#define LIZARDFS_ERROR_CHUNKLOST                8    // Chunk lost
-#define LIZARDFS_ERROR_OUTOFMEMORY              9    // Out of memory
-#define LIZARDFS_ERROR_INDEXTOOBIG             10    // Index too big
-#define LIZARDFS_ERROR_LOCKED                  11    // Chunk locked
-#define LIZARDFS_ERROR_NOCHUNKSERVERS          12    // No chunk servers
-#define LIZARDFS_ERROR_NOCHUNK                 13    // No such chunk
-#define LIZARDFS_ERROR_CHUNKBUSY               14    // Chunk is busy
-#define LIZARDFS_ERROR_REGISTER                15    // Incorrect register BLOB
-#define LIZARDFS_ERROR_NOTDONE                 16    // Requested operation not completed
-#define LIZARDFS_ERROR_GROUPNOTREGISTERED      17    // Group info is not registered in master server
-#define LIZARDFS_ERROR_NOTSTARTED              18    // Write not started
-#define LIZARDFS_ERROR_WRONGVERSION            19    // Wrong chunk version
-#define LIZARDFS_ERROR_CHUNKEXIST              20    // Chunk already exists
-#define LIZARDFS_ERROR_NOSPACE                 21    // No space left
-#define LIZARDFS_ERROR_IO                      22    // IO error
-#define LIZARDFS_ERROR_BNUMTOOBIG              23    // Incorrect block number
-#define LIZARDFS_ERROR_WRONGSIZE               24    // Incorrect size
-#define LIZARDFS_ERROR_WRONGOFFSET             25    // Incorrect offset
-#define LIZARDFS_ERROR_CANTCONNECT             26    // Can't connect
-#define LIZARDFS_ERROR_WRONGCHUNKID            27    // Incorrect chunk id
-#define LIZARDFS_ERROR_DISCONNECTED            28    // Disconnected
-#define LIZARDFS_ERROR_CRC                     29    // CRC error
-#define LIZARDFS_ERROR_DELAYED                 30    // Operation delayed
-#define LIZARDFS_ERROR_CANTCREATEPATH          31    // Can't create path
-#define LIZARDFS_ERROR_MISMATCH                32    // Data mismatch
-#define LIZARDFS_ERROR_EROFS                   33    // Read-only file system
-#define LIZARDFS_ERROR_QUOTA                   34    // Quota exceeded
-#define LIZARDFS_ERROR_BADSESSIONID            35    // Bad session id
-#define LIZARDFS_ERROR_NOPASSWORD              36    // Password is needed
-#define LIZARDFS_ERROR_BADPASSWORD             37    // Incorrect password
-#define LIZARDFS_ERROR_ENOATTR                 38    // Attribute not found
-#define LIZARDFS_ERROR_ENOTSUP                 39    // Operation not supported
-#define LIZARDFS_ERROR_ERANGE                  40    // Result too large
-#define LIZARDFS_ERROR_TIMEOUT                 41    // Timeout
-#define LIZARDFS_ERROR_BADMETADATACHECKSUM     42    // Metadata checksum not matching
-#define LIZARDFS_ERROR_CHANGELOGINCONSISTENT   43    // Changelog inconsistent
-#define LIZARDFS_ERROR_PARSE                   44    // Parsing unsuccessful
-#define LIZARDFS_ERROR_METADATAVERSIONMISMATCH 45    // Metadata version mismatch
-#define LIZARDFS_ERROR_NOTLOCKED               46    // No such lock
-#define LIZARDFS_ERROR_WRONGLOCKID             47    // Wrong lock id
-#define LIZARDFS_ERROR_NOTPOSSIBLE             48    // It's not possible to perform operation in this way
-#define LIZARDFS_ERROR_TEMP_NOTPOSSIBLE        49    // Operation temporarily not possible
-#define LIZARDFS_ERROR_WAITING                 50    // Waiting for operation completion
-#define LIZARDFS_ERROR_UNKNOWN                 51    // Unknown error
-
-#define LIZARDFS_ERROR_MAX                     52
-
-#define LIZARDFS_ERROR_STRINGS \
-	"OK", \
-	"Operation not permitted", \
-	"Not a directory", \
-	"No such file or directory", \
-	"Permission denied", \
-	"File exists", \
-	"Invalid argument", \
-	"Directory not empty", \
-	"Chunk lost", \
-	"Out of memory", \
-	"Index too big", \
-	"Chunk locked", \
-	"No chunk servers", \
-	"No such chunk", \
-	"Chunk is busy", \
-	"Incorrect register BLOB", \
-	"Requested operation not completed", \
-	"Group info is not registered in master server", \
-	"Write not started", \
-	"Wrong chunk version", \
-	"Chunk already exists", \
-	"No space left", \
-	"IO error", \
-	"Incorrect block number", \
-	"Incorrect size", \
-	"Incorrect offset", \
-	"Can't connect", \
-	"Incorrect chunk id", \
-	"Disconnected", \
-	"CRC error", \
-	"Operation delayed", \
-	"Can't create path", \
-	"Data mismatch", \
-	"Read-only file system", \
-	"Quota exceeded", \
-	"Bad session id", \
-	"Password is needed", \
-	"Incorrect password", \
-	"Attribute not found", \
-	"Operation not supported", \
-	"Result too large", \
-	"Timeout", \
-	"Metadata checksum not matching", \
-	"Changelog inconsistent", \
-	"Parsing unsuccessful", \
-	"Metadata version mismatch", \
-	"No such lock", \
-	"Wrong lock id", \
-	"Operation not possible", \
-	"Operation temporarily not possible", \
-	"Waiting for operation completion", \
-	"Unknown LizardFS error", \
-	"Unknown LizardFS error"
 
 /// field values: nodetype
 #define TYPE_FILE             'f'
@@ -334,16 +225,6 @@ enum class SugidClearMode {
 	kXfs = 5
 };
 #endif
-
-#define SUGID_CLEAR_MODE_OPTIONS 6
-
-#define SUGID_CLEAR_MODE_STRINGS \
-	"never", \
-	"always", \
-	"osx", \
-	"bsd", \
-	"ext", \
-	"xfs"
 
 /// field values: operation
 #define LIZARDFS_LOCK_UNLOCK    1
@@ -1357,11 +1238,11 @@ enum class SugidClearMode {
 /// msgid:32 status:8
 
 //0x01E2
-#define LIZ_CLTOMA_CHUNK_INFO (1000U + 482U)
+#define LIZ_CLTOMA_CHUNKS_INFO (1000U + 482U)
 /// msgid:32 inode:32 chunkindex:32
 
 //0x01E3
-#define LIZ_MATOCL_CHUNK_INFO (1000U + 483U)
+#define LIZ_MATOCL_CHUNKS_INFO (1000U + 483U)
 
 //0x01E4
 #define LIZ_CLTOMA_UPDATE_CREDENTIALS (1000U + 484U)
@@ -1855,6 +1736,22 @@ enum class SugidClearMode {
 // 0x63E
 #define LIZ_MATOCL_LIST_DEFECTIVE_FILES (1000U + 598U)
 /// last_entry_index:64 files:(vector<DefectiveFileInfo>)
+
+// 0x63f
+#define LIZ_CLTOMA_FUSE_GETRESERVED (1000U + 599U)
+/// msgid:32 off:32 max_entries:32
+
+// 0x640
+#define LIZ_MATOCL_FUSE_GETRESERVED (1000U + 600U)
+/// msgid:32 entries:(vector<NamedInodeEntry>)
+
+// 0x641
+#define LIZ_CLTOMA_FUSE_GETTRASH (1000U + 601U)
+/// msgid:32 off:32 max_entries:32
+
+// 0x642
+#define LIZ_MATOCL_FUSE_GETTRASH (1000U + 602U)
+/// msgid:32 entries:(vector<NamedInodeEntry>)
 
 // CHUNKSERVER STATS
 

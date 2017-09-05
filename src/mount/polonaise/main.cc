@@ -32,9 +32,9 @@
 #include <thrift/transport/TServerSocket.h>
 
 #include "common/crc.h"
+#include "common/errno_defs.h"
 #include "common/slogger.h"
 #include "common/sockets.h"
-#include "mount/errno_defs.h"
 #include "mount/g_io_limiters.h"
 #include "mount/lizard_client.h"
 #include "mount/mastercomm.h"
@@ -415,7 +415,7 @@ static EntryReply toEntryReply(const LizardClient::EntryParam& in) {
  */
 #define OPERATION_EPILOG\
 		} catch (LizardClient::RequestException& ex) {\
-			throw makeStatus(toStatusCode(ex.errNo));\
+			throw makeStatus(toStatusCode(ex.system_error_code));\
 		} catch (Failure& ex) {\
 			std::cerr << __FUNCTION__ << " failure: " << ex.message << std::endl;\
 			lzfs_pretty_syslog(LOG_ERR, "%s Failure: %s", __FUNCTION__, ex.message.c_str());\
@@ -462,12 +462,11 @@ public:
 	 * \note for more information, see the protocol definition in Polonaise sources
 	 */
 	void getattr(AttributesReply& _return, const Context& context, const Inode inode,
-			const Descriptor descriptor) {
+			const Descriptor) {
 		OPERATION_PROLOG
 		LizardClient::AttrReply reply = LizardClient::getattr(
 				toLizardFsContext(context),
-				toUint64(inode),
-				getFileInfo(descriptor));
+				toUint64(inode));
 		_return.attributes = toFileStat(reply.attr);
 		_return.attributesTimeout = reply.attrTimeout;
 		OPERATION_EPILOG
@@ -478,15 +477,14 @@ public:
 	 * \note for more information, see the protocol definition in Polonaise sources
 	 */
 	void setattr(AttributesReply& _return, const Context& context, const Inode inode,
-			const FileStat& attributes, const int32_t toSet, const Descriptor descriptor) {
+			const FileStat& attributes, const int32_t toSet, const Descriptor) {
 		OPERATION_PROLOG
 		struct stat stats = toStructStat(attributes);
 		LizardClient::AttrReply reply = LizardClient::setattr(
 				toLizardFsContext(context),
 				toUint64(inode),
 				&stats,
-				toLizardfsAttributesSet(toSet),
-				getFileInfo(descriptor));
+				toLizardfsAttributesSet(toSet));
 		_return.attributes = toFileStat(reply.attr);
 		_return.attributesTimeout = reply.attrTimeout;
 		OPERATION_EPILOG
@@ -533,7 +531,7 @@ public:
 	Descriptor opendir(const Context& context, const Inode inode) {
 		OPERATION_PROLOG
 		Descriptor descriptor = createDescriptor(0);
-		LizardClient::opendir(toLizardFsContext(context), toUint32(inode), getFileInfo(descriptor));
+		LizardClient::opendir(toLizardFsContext(context), toUint32(inode));
 		return descriptor;
 		OPERATION_EPILOG
 	}
@@ -544,17 +542,13 @@ public:
 	 */
 	void readdir(std::vector<polonaise::DirectoryEntry> & _return, const Context& context,
 			const Inode inode, const int64_t firstEntryOffset,
-			const int64_t maxNumberOfEntries, const Descriptor descriptor) {
+			const int64_t maxNumberOfEntries, const Descriptor) {
 		OPERATION_PROLOG
-		if (descriptor == g_polonaise_constants.kNullDescriptor) {
-			throw makeFailure("Null descriptor");
-		}
 		std::vector<LizardClient::DirEntry> entries = LizardClient::readdir(
 				toLizardFsContext(context),
 				toUint64(inode),
 				firstEntryOffset,
-				toUint64(maxNumberOfEntries),
-				getFileInfo(descriptor));
+				toUint64(maxNumberOfEntries));
 
 		_return.reserve(entries.size());
 		for (LizardClient::DirEntry& entry : entries) {
@@ -570,15 +564,9 @@ public:
 	 * Implement Polonaise.releasedir method
 	 * \note for more information, see the protocol definition in Polonaise sources
 	 */
-	void releasedir(const Context& context, const Inode inode, const Descriptor descriptor) {
+	void releasedir(const Context&, const Inode inode, const Descriptor descriptor) {
 		OPERATION_PROLOG
-		if (descriptor == g_polonaise_constants.kNullDescriptor) {
-			throw makeFailure("Null descriptor");
-		}
-		LizardClient::releasedir(
-				toLizardFsContext(context),
-				toUint64(inode),
-				getFileInfo(descriptor));
+		LizardClient::releasedir(toUint64(inode));
 		removeDescriptor(descriptor);
 		OPERATION_EPILOG
 	}
@@ -740,12 +728,12 @@ public:
 	 * Implement Polonaise.release method
 	 * \note for more information, see the protocol definition in Polonaise sources
 	 */
-	void release(const Context& context, const Inode inode, const Descriptor descriptor) {
+	void release(const Context&, const Inode inode, const Descriptor descriptor) {
 		OPERATION_PROLOG
 		if (descriptor == g_polonaise_constants.kNullDescriptor) {
 			throw makeFailure("Null descriptor");
 		}
-		LizardClient::release(toLizardFsContext(context), toUint64(inode), getFileInfo(descriptor));
+		LizardClient::release(toUint64(inode), getFileInfo(descriptor));
 		removeDescriptor(descriptor);
 		OPERATION_EPILOG
 	}
@@ -1074,38 +1062,41 @@ int main (int argc, char **argv) {
 	setvbuf(stderr, NULL, _IONBF, 0);
 
 	// Initialize LizardFS client
-	socketinit();
-	strerr_init();
-	mycrc32_init();
-	if (fs_init_master_connection(nullptr,
-				gSetup.master_host.c_str(), gSetup.master_port.c_str(),
-				0, gSetup.mountpoint.c_str(), gSetup.subfolder.c_str(), nullptr,
-				gSetup.forget_password, 0, gSetup.io_retries, gSetup.report_reserved_period) < 0) {
-		std::cerr << "Can't initialize connection with master server" << std::endl;
-		lzfs_pretty_syslog(LOG_ERR, "Can't initialize connection with master server");
-		return 2;
-	}
-	symlink_cache_init();
-	gGlobalIoLimiter();
-	fs_init_threads(gSetup.io_retries);
-	masterproxy_init();
-	gLocalIoLimiter();
-	IoLimitsConfigLoader loader;
-	gMountLimiter().loadConfiguration(loader);
-	read_data_init(gSetup.io_retries,
-			chunkserverrtt,
-			chunkserverconnectreadto,
-			chunkserverwavereadto,
-			chunkservertotalreadto,
-			cacheexpirationtime,
-			readaheadmaxwindowsize,
-			prefetchFullXorStripes,
-			bandwidthOveruse);
-	write_data_init(gSetup.write_buffer_size, gSetup.io_retries, writeworkers,
-			writewindowsize, chunkserverwriteto, cacheperinodepercentage);
-	LizardClient::init(gSetup.debug, true, gSetup.direntry_cache_timeout, gSetup.direntry_cache_size,
-			gSetup.entry_cache_timeout, gSetup.attr_cache_timeout,
-			!gSetup.no_mkdir_copy_sgid, gSetup.sugid_clear_mode, gSetup.enable_acl, userwlock, 0, 0);
+	LizardClient::FsInitParams params("", gSetup.master_host, gSetup.master_port, gSetup.mountpoint);
+	params.meta = false;
+	params.subfolder = gSetup.subfolder;
+	params.password_digest = std::vector<uint8_t>(gSetup.password.begin(), gSetup.password.end());
+	params.do_not_remember_password = gSetup.forget_password;
+	params.report_reserved_period = gSetup.report_reserved_period;
+	params.bandwidth_overuse = bandwidthOveruse;
+
+	params.io_retries = gSetup.io_retries;
+	params.chunkserver_round_time_ms = chunkserverrtt;
+	params.chunkserver_connect_timeout_ms = chunkserverconnectreadto;
+	params.chunkserver_wave_read_timeout_ms = chunkserverwavereadto;
+	params.total_read_timeout_ms = chunkservertotalreadto;
+	params.cache_expiration_time_ms = cacheexpirationtime;
+	params.readahead_max_window_size_kB = readaheadmaxwindowsize;
+	params.prefetch_xor_stripes = prefetchFullXorStripes;
+	params.write_cache_size = gSetup.write_buffer_size;
+	params.write_workers = writeworkers;
+	params.write_window_size = writewindowsize;
+	params.chunkserver_write_timeout_ms = chunkserverwriteto;
+	params.cache_per_inode_percentage = cacheperinodepercentage;
+
+	params.keep_cache = true;
+	params.direntry_cache_timeout = gSetup.direntry_cache_timeout;
+	params.direntry_cache_size = gSetup.direntry_cache_size;
+	params.entry_cache_timeout = gSetup.entry_cache_timeout;
+	params.attr_cache_timeout = gSetup.attr_cache_timeout;
+	params.mkdir_copy_sgid = !gSetup.no_mkdir_copy_sgid;
+	params.sugid_clear_mode = gSetup.sugid_clear_mode;
+	params.acl_enabled = gSetup.enable_acl;
+	params.use_rw_lock = userwlock;
+
+	params.debug_mode = gSetup.debug;
+	params.verbose = true;
+	LizardClient::fs_init(params);
 
 	// Thrift server start
 	using namespace ::apache::thrift;
@@ -1134,12 +1125,7 @@ int main (int argc, char **argv) {
 		gServer->serve();
 	}
 
-	write_data_term();
-	read_data_term();
-	masterproxy_term();
-	fs_term();
-	symlink_cache_term();
-	socketrelease();
+	LizardClient::fs_term();
 
 	return 0;
 }

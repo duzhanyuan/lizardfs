@@ -26,6 +26,7 @@
 #include "common/attributes.h"
 #include "common/event_loop.h"
 #include "master/changelog.h"
+#include "master/chunks.h"
 #include "master/filesystem.h"
 #include "master/filesystem_checksum.h"
 #include "master/filesystem_checksum_updater.h"
@@ -41,6 +42,8 @@
 #include "protocol/matocl.h"
 
 std::array<uint32_t, FsStats::Size> gFsStatsArray = {{}};
+
+static const char kAclXattrs[] = "system.posix_acl_access\0system.posix_acl_default\0system.richacl\0system.nfs4_acl";
 
 void fs_retrieve_stats(std::array<uint32_t, FsStats::Size> &output_stats) {
 	output_stats = gFsStatsArray;
@@ -110,6 +113,10 @@ void fs_readreserved_data(uint32_t rootinode, uint8_t sesflags, uint8_t *dbuff) 
 	fsnodes_getdetacheddata(gMetadata->reserved, dbuff);
 }
 
+void fs_readreserved(uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries) {
+	fsnodes_getdetacheddata(gMetadata->reserved, off, max_entries, entries);
+}
+
 uint8_t fs_readtrash_size(uint32_t rootinode, uint8_t sesflags, uint32_t *dbuffsize) {
 	if (rootinode != 0) {
 		return LIZARDFS_ERROR_EPERM;
@@ -123,6 +130,10 @@ void fs_readtrash_data(uint32_t rootinode, uint8_t sesflags, uint8_t *dbuff) {
 	(void)rootinode;
 	(void)sesflags;
 	fsnodes_getdetacheddata(gMetadata->trash, dbuff);
+}
+
+void fs_readtrash(uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries) {
+	fsnodes_getdetacheddata(gMetadata->trash, off, max_entries, entries);
 }
 
 /* common procedure for trash and reserved files */
@@ -462,6 +473,9 @@ uint8_t fs_whole_path_lookup(const FsContext &context, uint32_t parent, const st
 	}
 
 	*found_inode = tmp_inode;
+	if (tmp_inode == context.rootinode()) {
+		return fs_getattr(context, tmp_inode, attr);
+	}
 	return LIZARDFS_STATUS_OK;
 }
 
@@ -737,8 +751,8 @@ uint8_t fs_setattr(const FsContext &context, uint32_t inode, uint8_t setmask, ui
 	}
 	if (setmask & SET_MODE_FLAG) {
 		p->mode = (attrmode & 07777) | (p->mode & 0xF000);
-		if (p->extendedAcl) {
-			p->extendedAcl->setMode(p->mode);
+		if (p->acl) {
+			p->acl->setMode(p->mode, p->type == FSNode::kDirectory);
 		}
 	}
 	if (setmask & (SET_UID_FLAG | SET_GID_FLAG)) {
@@ -775,8 +789,8 @@ uint8_t fs_apply_attr(uint32_t ts, uint32_t inode, uint32_t mode, uint32_t uid, 
 		return LIZARDFS_ERROR_EINVAL;
 	}
 	p->mode = mode | (p->mode & 0xF000);
-	if (p->extendedAcl) {
-		p->extendedAcl->setMode(p->mode);
+	if (p->acl) {
+		p->acl->setMode(p->mode, p->type == FSNode::kDirectory);
 	}
 	if (p->uid != uid || p->gid != gid) {
 		fsnodes_change_uid_gid(p, uid, gid);
@@ -1389,7 +1403,7 @@ int fs_posixlock_probe(const FsContext &context, uint32_t inode, uint64_t start,
 	} else {
 		info.l_type = static_cast<int>(collision->type);
 		info.l_start = collision->start;
-		info.l_len = collision->end - collision->start;
+		info.l_len = std::min<uint64_t>(collision->end - collision->start, std::numeric_limits<int64_t>::max());
 		return LIZARDFS_ERROR_WAITING;
 	}
 }
@@ -2505,12 +2519,13 @@ uint8_t fs_listxattr_leng(const FsContext &context, uint32_t inode, uint8_t open
 		return status;
 	}
 
-	*xasize = 0;
+	*xasize = sizeof(kAclXattrs);
 	return xattr_listattr_leng(p->id, xanode, xasize);
 }
 
 void fs_listxattr_data(void *xanode, uint8_t *xabuff) {
-	xattr_listattr_data(xanode, xabuff);
+	memcpy(xabuff, kAclXattrs, sizeof(kAclXattrs));
+	xattr_listattr_data(xanode, xabuff + sizeof(kAclXattrs));
 }
 
 uint8_t fs_setxattr(const FsContext &context, uint32_t inode, uint8_t opened,
@@ -2613,8 +2628,13 @@ uint8_t fs_deleteacl(const FsContext &context, uint32_t inode, AclType type) {
 	status = fsnodes_deleteacl(p, type, context.ts());
 	if (context.isPersonalityMaster()) {
 		if (status == LIZARDFS_STATUS_OK) {
-			fs_changelog(context.ts(), "DELETEACL(%" PRIu32 ",%c)", p->id,
-			             (type == AclType::kAccess ? 'a' : 'd'));
+			static char acl_type[3] = {'a', 'd', 'r'};
+
+			static_assert((int)AclType::kAccess == 0, "fix acl_type table");
+			static_assert((int)AclType::kDefault == 1, "fix acl_type table");
+			static_assert((int)AclType::kRichACL == 2, "fix acl_type table");
+
+			fs_changelog(context.ts(), "DELETEACL(%" PRIu32 ",%c)", p->id, acl_type[std::min(3, (int)type)]);
 		}
 	} else {
 		gMetadata->metaversion++;
@@ -2624,7 +2644,7 @@ uint8_t fs_deleteacl(const FsContext &context, uint32_t inode, AclType type) {
 
 #ifndef METARESTORE
 
-uint8_t fs_setacl(const FsContext &context, uint32_t inode, AclType type, AccessControlList acl) {
+uint8_t fs_setacl(const FsContext &context, uint32_t inode, const RichACL &acl) {
 	ChecksumUpdater cu(context.ts());
 	FSNode *p;
 	uint8_t status = verify_session(context, OperationMode::kReadWrite, SessionType::kNotMeta);
@@ -2636,12 +2656,11 @@ uint8_t fs_setacl(const FsContext &context, uint32_t inode, AclType type, Access
 	if (status != LIZARDFS_STATUS_OK) {
 		return status;
 	}
-	std::string aclString = acl.toString();
-	status = fsnodes_setacl(p, type, std::move(acl), context.ts());
+	std::string acl_string = acl.toString();
+	status = fsnodes_setacl(p, acl, context.ts());
 	if (context.isPersonalityMaster()) {
 		if (status == LIZARDFS_STATUS_OK) {
-			fs_changelog(context.ts(), "SETACL(%" PRIu32 ",%c,%s)", p->id,
-			             (type == AclType::kAccess ? 'a' : 'd'), aclString.c_str());
+			fs_changelog(context.ts(), "SETRICHACL(%" PRIu32 ",%s)", p->id, acl_string.c_str());
 		}
 	} else {
 		gMetadata->metaversion++;
@@ -2649,7 +2668,34 @@ uint8_t fs_setacl(const FsContext &context, uint32_t inode, AclType type, Access
 	return status;
 }
 
-uint8_t fs_getacl(const FsContext &context, uint32_t inode, AclType type, AccessControlList &acl) {
+uint8_t fs_setacl(const FsContext &context, uint32_t inode, AclType type, const AccessControlList &acl) {
+	ChecksumUpdater cu(context.ts());
+	FSNode *p;
+	uint8_t status = verify_session(context, OperationMode::kReadWrite, SessionType::kNotMeta);
+	if (status != LIZARDFS_STATUS_OK) {
+		return status;
+	}
+	status = fsnodes_get_node_for_operation(context, ExpectedNodeType::kAny, MODE_MASK_EMPTY,
+	                                        inode, &p);
+	if (status != LIZARDFS_STATUS_OK) {
+		return status;
+	}
+	std::string acl_string = acl.toString();
+	status = fsnodes_setacl(p, type, acl, context.ts());
+	if (context.isPersonalityMaster()) {
+		if (status == LIZARDFS_STATUS_OK) {
+			fs_changelog(context.ts(), "SETACL(%" PRIu32 ",%c,%s)", p->id,
+						 (type == AclType::kAccess ? 'a' : 'd'), acl_string.c_str());
+		}
+	} else {
+		gMetadata->metaversion++;
+	}
+	return status;
+
+	return LIZARDFS_ERROR_EINVAL;
+}
+
+uint8_t fs_getacl(const FsContext &context, uint32_t inode, RichACL &acl) {
 	FSNode *p;
 	uint8_t status = verify_session(context, OperationMode::kReadOnly, SessionType::kAny);
 	if (status != LIZARDFS_STATUS_OK) {
@@ -2660,7 +2706,7 @@ uint8_t fs_getacl(const FsContext &context, uint32_t inode, AclType type, Access
 	if (status != LIZARDFS_STATUS_OK) {
 		return status;
 	}
-	return fsnodes_getacl(p, type, acl);
+	return fsnodes_getacl(p, acl);
 }
 
 #endif /* #ifndef METARESTORE */
@@ -2681,6 +2727,24 @@ uint8_t fs_apply_setacl(uint32_t ts, uint32_t inode, char aclType, const char *a
 		return LIZARDFS_ERROR_EINVAL;
 	}
 	uint8_t status = fsnodes_setacl(p, aclTypeEnum, std::move(acl), ts);
+	if (status == LIZARDFS_STATUS_OK) {
+		gMetadata->metaversion++;
+	}
+	return status;
+}
+
+uint8_t fs_apply_setrichacl(uint32_t ts, uint32_t inode, const std::string &acl_string) {
+	RichACL acl;
+	try {
+		acl = RichACL::fromString(acl_string);
+	} catch (Exception &) {
+		return LIZARDFS_ERROR_EINVAL;
+	}
+	FSNode *p = fsnodes_id_to_node(inode);
+	if (!p) {
+		return LIZARDFS_ERROR_ENOENT;
+	}
+	uint8_t status = fsnodes_setacl(p, std::move(acl), ts);
 	if (status == LIZARDFS_STATUS_OK) {
 		gMetadata->metaversion++;
 	}
@@ -2886,6 +2950,56 @@ uint8_t fs_cancel_job(uint32_t job_id) {
 
 uint32_t fs_reserve_job_id() {
 	return gMetadata->task_manager.reserveJobId();
+}
+
+uint8_t fs_getchunksinfo(const FsContext& context, uint32_t current_ip, uint32_t inode,
+		uint32_t chunk_index, uint32_t chunk_count, std::vector<ChunkWithAddressAndLabel> &chunks) {
+	static constexpr int kMaxNumberOfChunkCopies = 100;
+
+	FSNode *p;
+
+	uint8_t status = verify_session(context, OperationMode::kReadOnly, SessionType::kAny);
+	if (status != LIZARDFS_STATUS_OK) {
+		return status;
+	}
+
+	status = fsnodes_get_node_for_operation(context, ExpectedNodeType::kFile, MODE_MASK_R,
+	                                        inode, &p);
+	if (status != LIZARDFS_STATUS_OK) {
+		return status;
+	}
+	if (chunk_index > MAX_INDEX) {
+		return LIZARDFS_ERROR_INDEXTOOBIG;
+	}
+
+	FSNodeFile *file_node = static_cast<FSNodeFile *>(p);
+
+	std::vector<ChunkPartWithAddressAndLabel> chunk_parts;
+
+	if (chunk_count == 0) {
+		chunk_count = file_node->chunks.size();
+	}
+
+	chunks.clear();
+	while(chunk_index < file_node->chunks.size() && chunk_count > 0) {
+		uint64_t chunk_id = file_node->chunks[chunk_index];
+		uint32_t chunk_version;
+
+		chunk_parts.clear();
+		chunk_version = 0;
+		if (chunk_id > 0) {
+			status = chunk_getversionandlocations(chunk_id, current_ip, chunk_version, kMaxNumberOfChunkCopies, chunk_parts);
+			if (status != LIZARDFS_STATUS_OK) {
+				return status;
+			}
+		}
+
+		chunks.emplace_back(std::move(chunk_id), std::move(chunk_version), std::move(chunk_parts));
+		chunk_index++;
+		chunk_count--;
+	}
+
+	return LIZARDFS_STATUS_OK;
 }
 
 #endif

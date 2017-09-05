@@ -28,16 +28,180 @@
 #include <utility>
 #include <vector>
 
+#include "common/chunk_with_address_and_label.h"
 #include "common/exception.h"
 #include "mount/group_cache.h"
 #include "mount/lizard_client_context.h"
 #include "mount/readdata_cache.h"
 #include "mount/stat_defs.h"
+#include "protocol/chunkserver_list_entry.h"
 #include "protocol/lock_info.h"
+#include "protocol/named_inode_entry.h"
 
 namespace LizardClient {
 
-typedef unsigned long int Inode;
+typedef uint32_t Inode;
+typedef uint32_t JobId;
+typedef uint32_t NamedInodeOffset;
+
+struct FsInitParams {
+	static constexpr const char *kDefaultSubfolder = "/";
+	static constexpr bool     kDefaultDoNotRememberPassword = false;
+	static constexpr bool     kDefaultDelayedInit = false;
+#ifdef _WIN32
+	static constexpr unsigned kDefaultReportReservedPeriod = 60;
+#else
+	static constexpr unsigned kDefaultReportReservedPeriod = 30;
+#endif
+	static constexpr unsigned kDefaultIoRetries = 30;
+	static constexpr unsigned kDefaultRoundTime = 200;
+	static constexpr unsigned kDefaultChunkserverConnectTo = 2000;
+	static constexpr unsigned kDefaultChunkserverReadTo = 2000;
+	static constexpr unsigned kDefaultChunkserverWaveReadTo = 500;
+	static constexpr unsigned kDefaultChunkserverTotalReadTo = 2000;
+	static constexpr unsigned kDefaultCacheExpirationTime = 0;
+	static constexpr unsigned kDefaultReadaheadMaxWindowSize = 4096;
+	static constexpr bool     kDefaultPrefetchXorStripes = false;
+
+	static constexpr float    kDefaultBandwidthOveruse = 1.25;
+	static constexpr unsigned kDefaultChunkserverWriteTo = 5000;
+#ifdef _WIN32
+	static constexpr unsigned kDefaultWriteCacheSize = 50;
+#else
+	static constexpr unsigned kDefaultWriteCacheSize = 0;
+#endif
+	static constexpr unsigned kDefaultCachePerInodePercentage = 25;
+	static constexpr unsigned kDefaultWriteWorkers = 10;
+	static constexpr unsigned kDefaultWriteWindowSize = 15;
+	static constexpr unsigned kDefaultSymlinkCacheTimeout = 3600;
+
+	static constexpr bool     kDefaultDebugMode = false;
+	static constexpr int      kDefaultKeepCache = 0;
+	static constexpr double   kDefaultDirentryCacheTimeout = 0.25;
+	static constexpr unsigned kDefaultDirentryCacheSize = 100000;
+	static constexpr double   kDefaultEntryCacheTimeout = 0.0;
+	static constexpr double   kDefaultAttrCacheTimeout = 1.0;
+#ifdef __linux__
+	static constexpr bool     kDefaultMkdirCopySgid = true;
+#else
+	static constexpr bool     kDefaultMkdirCopySgid = false;
+#endif
+#if defined(DEFAULT_SUGID_CLEAR_MODE_EXT)
+	static constexpr SugidClearMode kDefaultSugidClearMode = SugidClearMode::kExt;
+#elif defined(DEFAULT_SUGID_CLEAR_MODE_BSD)
+	static constexpr SugidClearMode kDefaultSugidClearMode = SugidClearMode::kBsd;
+#elif defined(DEFAULT_SUGID_CLEAR_MODE_OSX)
+	static constexpr SugidClearMode kDefaultSugidClearMode = SugidClearMode::kOsx;
+#else
+	static constexpr SugidClearMode kDefaultSugidClearMode = SugidClearMode::kNever;
+#endif
+	static constexpr bool     kDefaultAclEnabled = false;
+	static constexpr bool     kDefaultUseRwLock = true;
+	static constexpr double   kDefaultAclCacheTimeout = 1.0;
+	static constexpr unsigned kDefaultAclCacheSize = 1000;
+	static constexpr bool     kDefaultVerbose = false;
+
+	// Thank you, GCC 4.6, for no delegating constructors
+	FsInitParams()
+	             : bind_host(), host(), port(), meta(false), mountpoint(), subfolder(kDefaultSubfolder),
+	             do_not_remember_password(kDefaultDoNotRememberPassword), delayed_init(kDefaultDelayedInit),
+	             report_reserved_period(kDefaultReportReservedPeriod),
+	             io_retries(kDefaultIoRetries),
+	             chunkserver_round_time_ms(kDefaultRoundTime),
+	             chunkserver_connect_timeout_ms(kDefaultChunkserverConnectTo),
+	             chunkserver_wave_read_timeout_ms(kDefaultChunkserverWaveReadTo),
+	             total_read_timeout_ms(kDefaultChunkserverTotalReadTo),
+	             cache_expiration_time_ms(kDefaultCacheExpirationTime),
+	             readahead_max_window_size_kB(kDefaultReadaheadMaxWindowSize),
+	             prefetch_xor_stripes(kDefaultPrefetchXorStripes),
+	             bandwidth_overuse(kDefaultBandwidthOveruse),
+	             write_cache_size(kDefaultWriteCacheSize),
+	             write_workers(kDefaultWriteWorkers), write_window_size(kDefaultWriteWindowSize),
+	             chunkserver_write_timeout_ms(kDefaultChunkserverWriteTo),
+	             cache_per_inode_percentage(kDefaultCachePerInodePercentage),
+	             symlink_cache_timeout_s(kDefaultSymlinkCacheTimeout),
+	             debug_mode(kDefaultDebugMode), keep_cache(kDefaultKeepCache),
+	             direntry_cache_timeout(kDefaultDirentryCacheTimeout), direntry_cache_size(kDefaultDirentryCacheSize),
+	             entry_cache_timeout(kDefaultEntryCacheTimeout), attr_cache_timeout(kDefaultAttrCacheTimeout),
+	             mkdir_copy_sgid(kDefaultMkdirCopySgid), sugid_clear_mode(kDefaultSugidClearMode),
+	             acl_enabled(kDefaultAclEnabled), use_rw_lock(kDefaultUseRwLock),
+	             acl_cache_timeout(kDefaultAclCacheTimeout), acl_cache_size(kDefaultAclCacheSize),
+	             verbose(kDefaultVerbose) {
+	}
+
+	FsInitParams(const std::string &bind_host, const std::string &host, const std::string &port, const std::string &mountpoint)
+	             : bind_host(bind_host), host(host), port(port), meta(false), mountpoint(mountpoint), subfolder(kDefaultSubfolder),
+	             do_not_remember_password(kDefaultDoNotRememberPassword), delayed_init(kDefaultDelayedInit),
+	             report_reserved_period(kDefaultReportReservedPeriod),
+	             io_retries(kDefaultIoRetries),
+	             chunkserver_round_time_ms(kDefaultRoundTime),
+	             chunkserver_connect_timeout_ms(kDefaultChunkserverConnectTo),
+	             chunkserver_wave_read_timeout_ms(kDefaultChunkserverWaveReadTo),
+	             total_read_timeout_ms(kDefaultChunkserverTotalReadTo),
+	             cache_expiration_time_ms(kDefaultCacheExpirationTime),
+	             readahead_max_window_size_kB(kDefaultReadaheadMaxWindowSize),
+	             prefetch_xor_stripes(kDefaultPrefetchXorStripes),
+	             bandwidth_overuse(kDefaultBandwidthOveruse),
+	             write_cache_size(kDefaultWriteCacheSize),
+	             write_workers(kDefaultWriteWorkers), write_window_size(kDefaultWriteWindowSize),
+	             chunkserver_write_timeout_ms(kDefaultChunkserverWriteTo),
+	             cache_per_inode_percentage(kDefaultCachePerInodePercentage),
+	             symlink_cache_timeout_s(kDefaultSymlinkCacheTimeout),
+	             debug_mode(kDefaultDebugMode), keep_cache(kDefaultKeepCache),
+	             direntry_cache_timeout(kDefaultDirentryCacheTimeout), direntry_cache_size(kDefaultDirentryCacheSize),
+	             entry_cache_timeout(kDefaultEntryCacheTimeout), attr_cache_timeout(kDefaultAttrCacheTimeout),
+	             mkdir_copy_sgid(kDefaultMkdirCopySgid), sugid_clear_mode(kDefaultSugidClearMode),
+	             acl_enabled(kDefaultAclEnabled), use_rw_lock(kDefaultUseRwLock),
+	             acl_cache_timeout(kDefaultAclCacheTimeout), acl_cache_size(kDefaultAclCacheSize),
+	             verbose(kDefaultVerbose) {
+	}
+
+	std::string bind_host;
+	std::string host;
+	std::string port;
+	bool meta;
+	std::string mountpoint;
+	std::string subfolder;
+	std::vector<uint8_t> password_digest;
+	bool do_not_remember_password;
+	bool delayed_init;
+	unsigned report_reserved_period;
+
+	unsigned io_retries;
+	unsigned chunkserver_round_time_ms;
+	unsigned chunkserver_connect_timeout_ms;
+	unsigned chunkserver_wave_read_timeout_ms;
+	unsigned total_read_timeout_ms;
+	unsigned cache_expiration_time_ms;
+	unsigned readahead_max_window_size_kB;
+	bool prefetch_xor_stripes;
+	double bandwidth_overuse;
+
+	unsigned write_cache_size;
+	unsigned write_workers;
+	unsigned write_window_size;
+	unsigned chunkserver_write_timeout_ms;
+	unsigned cache_per_inode_percentage;
+	unsigned symlink_cache_timeout_s;
+
+	bool debug_mode;
+	// NOTICE(sarna): This variable can hold more values than 0-1, don't change it to bool ever.
+	int keep_cache;
+	double direntry_cache_timeout;
+	unsigned direntry_cache_size;
+	double entry_cache_timeout;
+	double attr_cache_timeout;
+	bool mkdir_copy_sgid;
+	SugidClearMode sugid_clear_mode;
+	bool acl_enabled;
+	bool use_rw_lock;
+	double acl_cache_timeout;
+	unsigned acl_cache_size;
+
+	bool verbose;
+
+	std::string io_limits_config_file;
+};
 
 /**
  * A class that is used for passing information between subsequent calls to the filesystem.
@@ -45,6 +209,8 @@ typedef unsigned long int Inode;
  * removed when a file is closed.
  */
 struct FileInfo {
+	FileInfo() : flags(), direct_io(), keep_cache(), fh(), lock_owner() {}
+
 	FileInfo(int flags, unsigned int direct_io, unsigned int keep_cache, uint64_t fh,
 		uint64_t lock_owner)
 			: flags(flags),
@@ -52,6 +218,20 @@ struct FileInfo {
 			keep_cache(keep_cache),
 			fh(fh),
 			lock_owner(lock_owner) {
+	}
+
+	FileInfo(const FileInfo &other) = default;
+	FileInfo(FileInfo &&other) = default;
+
+	FileInfo &operator=(const FileInfo &other) = default;
+	FileInfo &operator=(FileInfo &&other) = default;
+
+	bool isValid() const {
+		return fh;
+	}
+
+	void reset() {
+		*this = FileInfo();
 	}
 
 	int flags;
@@ -108,22 +288,21 @@ struct XattrReply {
  * An exception that is thrown when a request can't be executed successfully
  */
 struct RequestException : public std::exception {
-	RequestException(int errNo);
+	explicit RequestException(int error_code);
 
-	int errNo;
+	int system_error_code;
+	int lizardfs_error_code;
 };
 
-int updateGroups(const GroupCache::Groups &groups);
+void updateGroups(Context &ctx);
 
 // TODO what about this one? Will decide when writing non-fuse client
 // void fsinit(void *userdata, struct fuse_conn_info *conn);
 bool isSpecialInode(LizardClient::Inode ino);
 
-void update_credentials(int index, const GroupCache::Groups &groups);
+EntryParam lookup(const Context &ctx, Inode parent, const char *name);
 
-EntryParam lookup(Context ctx, Inode parent, const char *name, bool whole_path_lookup = false);
-
-AttrReply getattr(Context ctx, Inode ino, FileInfo* fi);
+AttrReply getattr(const Context &ctx, Inode ino);
 
 #define LIZARDFS_SET_ATTR_MODE      (1 << 0)
 #define LIZARDFS_SET_ATTR_UID       (1 << 1)
@@ -133,95 +312,98 @@ AttrReply getattr(Context ctx, Inode ino, FileInfo* fi);
 #define LIZARDFS_SET_ATTR_MTIME     (1 << 5)
 #define LIZARDFS_SET_ATTR_ATIME_NOW (1 << 7)
 #define LIZARDFS_SET_ATTR_MTIME_NOW (1 << 8)
-AttrReply setattr(Context ctx, Inode ino, struct stat *stbuf, int to_set, FileInfo* fi);
+AttrReply setattr(const Context &ctx, Inode ino, struct stat *stbuf, int to_set);
 
-std::string readlink(Context ctx, Inode ino);
+std::string readlink(const Context &ctx, Inode ino);
 
-EntryParam mknod(Context ctx, Inode parent, const char *name, mode_t mode, dev_t rdev);
+EntryParam mknod(const Context &ctx, Inode parent, const char *name, mode_t mode, dev_t rdev);
 
-EntryParam mkdir(Context ctx, Inode parent, const char *name, mode_t mode);
+EntryParam mkdir(const Context &ctx, Inode parent, const char *name, mode_t mode);
 
-void unlink(Context ctx, Inode parent, const char *name);
+void unlink(const Context &ctx, Inode parent, const char *name);
 
-void rmdir(Context ctx, Inode parent, const char *name);
+void undel(const Context &ctx, Inode ino);
 
-EntryParam symlink(Context ctx, const char *link, Inode parent, const char *name);
+void rmdir(const Context &ctx, Inode parent, const char *name);
 
-void rename(Context ctx, Inode parent, const char *name, Inode newparent, const char *newname);
+EntryParam symlink(const Context &ctx, const char *link, Inode parent, const char *name);
 
-EntryParam link(Context ctx, Inode ino, Inode newparent, const char *newname);
+void rename(const Context &ctx, Inode parent, const char *name, Inode newparent, const char *newname);
 
-void open(Context ctx, Inode ino, FileInfo* fi);
+EntryParam link(const Context &ctx, Inode ino, Inode newparent, const char *newname);
 
-std::vector<uint8_t> read_special_inode(Context ctx, Inode ino, size_t size, off_t off,
+void open(const Context &ctx, Inode ino, FileInfo* fi);
+
+std::vector<uint8_t> read_special_inode(const Context &ctx, Inode ino, size_t size, off_t off,
 				        FileInfo* fi);
 
-ReadCache::Result read(Context ctx, Inode ino, size_t size, off_t off, FileInfo* fi);
+ReadCache::Result read(const Context &ctx, Inode ino, size_t size, off_t off, FileInfo* fi);
 
 typedef size_t BytesWritten;
-BytesWritten write(Context ctx, Inode ino, const char *buf, size_t size, off_t off,
+BytesWritten write(const Context &ctx, Inode ino, const char *buf, size_t size, off_t off,
 		FileInfo* fi);
 
-void flush(Context ctx, Inode ino, FileInfo* fi);
+void flush(const Context &ctx, Inode ino, FileInfo* fi);
 
-void release(Context ctx, Inode ino, FileInfo* fi);
+void release(Inode ino, FileInfo* fi);
 
-void fsync(Context ctx, Inode ino, int datasync, FileInfo* fi);
+void fsync(const Context &ctx, Inode ino, int datasync, FileInfo* fi);
 
-void opendir(Context ctx, Inode ino, FileInfo* fi);
+void opendir(const Context &ctx, Inode ino);
 
-std::vector<DirEntry> readdir(Context ctx, Inode ino, off_t off, size_t maxEntries, FileInfo* fi);
+std::vector<DirEntry> readdir(const Context &ctx, Inode ino, off_t off, size_t max_entries);
 
-void releasedir(Context ctx, Inode ino, FileInfo* fi);
+std::vector<NamedInodeEntry> readreserved(const Context &ctx, NamedInodeOffset offset, NamedInodeOffset max_entries);
 
-struct statvfs statfs(Context ctx, Inode ino);
+std::vector<NamedInodeEntry> readtrash(const Context &ctx, NamedInodeOffset offset, NamedInodeOffset max_entries);
 
-void setxattr(Context ctx, Inode ino, const char *name, const char *value,
+void releasedir(Inode ino);
+
+struct statvfs statfs(const Context &ctx, Inode ino);
+
+void setxattr(const Context &ctx, Inode ino, const char *name, const char *value,
 		size_t size, int flags, uint32_t position);
 
-XattrReply getxattr(Context ctx, Inode ino, const char *name, size_t size, uint32_t position);
+XattrReply getxattr(const Context &ctx, Inode ino, const char *name, size_t size, uint32_t position);
 
-XattrReply listxattr(Context ctx, Inode ino, size_t size);
+XattrReply listxattr(const Context &ctx, Inode ino, size_t size);
 
-void removexattr(Context ctx, Inode ino, const char *name);
+void removexattr(const Context &ctx, Inode ino, const char *name);
 
-void access(Context ctx, Inode ino, int mask);
+void access(const Context &ctx, Inode ino, int mask);
 
-EntryParam create(Context ctx, Inode parent, const char *name,
+EntryParam create(const Context &ctx, Inode parent, const char *name,
 		mode_t mode, FileInfo* fi);
 
-void getlk(Context ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
-void setlk(Context ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock, int sleep);
+void getlk(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
+void setlk(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock, int sleep);
 void flock_interrupt(uint32_t reqid);
 void setlk_interrupt(uint32_t reqid);
-void getlk(Context ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
-uint32_t setlk_send(Context ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
+void getlk(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
+uint32_t setlk_send(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
 void setlk_recv();
-uint32_t flock_send(Context ctx, Inode ino, FileInfo* fi, int op);
+uint32_t flock_send(const Context &ctx, Inode ino, FileInfo* fi, int op);
 void flock_recv();
 
 void flock_interrupt(const lzfs_locks::InterruptData &data);
 void setlk_interrupt(const lzfs_locks::InterruptData &data);
 
-void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_,
-		unsigned direntry_cache_size_, double entry_cache_timeout_, double attr_cache_timeout_,
-		int mkdir_copy_sgid_, SugidClearMode sugid_clear_mode_, bool acl_enabled_,
-		bool use_rw_lock_, double acl_cache_timeout_, unsigned acl_cache_size_);
-
 void remove_file_info(FileInfo *f);
 void remove_dir_info(FileInfo *f);
 
-// TODO what about following fuse_lowlevel_ops functions?
-// destroy
-// forget
-// fsyncdir
-// bmap
-// ioctl
-// poll
-// write_buf
-// retrieve_reply
-// forget_multi
-// fallocate
-// readdirplus
+JobId makesnapshot(const Context &ctx, Inode ino, Inode dst_parent, const std::string &dst_name,
+	          bool can_overwrite);
+std::string getgoal(const Context &ctx, Inode ino);
+void setgoal(const Context &ctx, Inode ino, const std::string &goal_name, uint8_t smode);
 
-} // namespace LizardClient
+void statfs(uint64_t *totalspace, uint64_t *availspace, uint64_t *trashspace, uint64_t *reservedspace, uint32_t *inodes);
+
+std::vector<ChunkWithAddressAndLabel> getchunksinfo(const Context &ctx, Inode ino,
+	                                                uint32_t chunk_index, uint32_t chunk_count);
+
+std::vector<ChunkserverListEntry> getchunkservers();
+
+void fs_init(FsInitParams &params);
+void fs_term();
+
+}

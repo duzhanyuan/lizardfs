@@ -32,12 +32,14 @@
 #include "common/metadataserver_list_entry.h"
 #include "common/moosefs_string.h"
 #include "common/moosefs_vector.h"
+#include "common/richacl.h"
 #include "common/serialization_macros.h"
 #include "common/serialized_goal.h"
 #include "common/tape_copy_location_info.h"
 #include "protocol/chunkserver_list_entry.h"
 #include "protocol/directory_entry.h"
 #include "protocol/lock_info.h"
+#include "protocol/named_inode_entry.h"
 #include "protocol/MFSCommunication.h"
 #include "protocol/packet.h"
 #include "protocol/quota.h"
@@ -86,6 +88,7 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kStatusPacketVersion, 0)
 LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kLegacyResponsePacketVersion, 1)
 LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kResponsePacketVersion, 2)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetAcl, kRichACLResponsePacketVersion, 3)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetAcl, LIZ_MATOCL_FUSE_GET_ACL, kStatusPacketVersion,
@@ -101,6 +104,12 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetAcl, LIZ_MATOCL_FUSE_GET_ACL, kResponsePacketVersion,
 		uint32_t, messageId,
 		AccessControlList, acl)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetAcl, LIZ_MATOCL_FUSE_GET_ACL, kRichACLResponsePacketVersion,
+		uint32_t, messageId,
+		uint32_t, owner,
+		RichACL, acl)
 
 // LIZ_MATOCL_FUSE_SET_ACL
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
@@ -216,8 +225,14 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		ChunksReplicationState, replication)
 
 // LIZ_MATOCL_CSERV_LIST
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, cservList, kStandard, 0)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, cservList, kWithMessageId, 1)
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, cservList, LIZ_MATOCL_CSERV_LIST, 0,
+		matocl, cservList, LIZ_MATOCL_CSERV_LIST, kStandard,
+		std::vector<ChunkserverListEntry>, cservList)
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, cservList, LIZ_MATOCL_CSERV_LIST, kWithMessageId,
+		uint32_t, message_id,
 		std::vector<ChunkserverListEntry>, cservList)
 
 // LIZ_MATOCL_METADATASERVERS_LIST
@@ -226,30 +241,24 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		uint32_t, masterVersion,
 		std::vector<MetadataserverListEntry>, shadowList)
 
-// LIZ_MATOCL_CHUNK_INFO
-LIZARDFS_DEFINE_PACKET_VERSION(matocl, chunkInfo, kStatusPacketVersion, 0)
-LIZARDFS_DEFINE_PACKET_VERSION(matocl, chunkInfo, kResponsePacketVersion, 1)
-LIZARDFS_DEFINE_PACKET_VERSION(matocl, chunkInfo, kECChunks_ResponsePacketVersion, 2)
+// LIZ_MATOCL_CHUNKS_INFO
+namespace matocl {
+namespace chunksInfo {
+	static constexpr uint32_t kMaxNumberOfResultEntries = 4096;
+}
+}
+
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, chunksInfo, kStatusPacketVersion, 0)
+LIZARDFS_DEFINE_PACKET_VERSION(matocl, chunksInfo, kResponsePacketVersion, 1)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, chunkInfo, LIZ_MATOCL_CHUNK_INFO, kStatusPacketVersion,
-		uint32_t, messageId,
+		matocl, chunksInfo, LIZ_MATOCL_CHUNKS_INFO, kStatusPacketVersion,
+		uint32_t, message_id,
 		uint8_t, status)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, chunkInfo, LIZ_MATOCL_CHUNK_INFO, kResponsePacketVersion,
-		uint32_t, messageId,
-		uint64_t, fileLength,
-		uint64_t, chunkId,
-		uint32_t, chunkVersion,
-		std::vector<legacy::ChunkWithAddressAndLabel>, chunks)
-
-LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, chunkInfo, LIZ_MATOCL_CHUNK_INFO, kECChunks_ResponsePacketVersion,
-		uint32_t, messageId,
-		uint64_t, fileLength,
-		uint64_t, chunkId,
-		uint32_t, chunkVersion,
+		matocl, chunksInfo, LIZ_MATOCL_CHUNKS_INFO, kResponsePacketVersion,
+		uint32_t, message_id,
 		std::vector<ChunkWithAddressAndLabel>, chunks)
 
 // LIZ_MATOCL_HOSTNAME
@@ -359,12 +368,12 @@ LIZARDFS_DEFINE_PACKET_VERSION(matocl, fuseGetlk, kResponsePacketVersion, 1)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetlk, LIZ_MATOCL_FUSE_GETLK, kStatusPacketVersion,
-		uint32_t, messageId,
+		uint32_t, message_id,
 		uint8_t, status)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetlk, LIZ_MATOCL_FUSE_GETLK, kResponsePacketVersion,
-		uint32_t, messageId,
+		uint32_t, message_id,
 		lzfs_locks::FlockWrapper, lock)
 
 // LIZ_MATOCL_FUSE_SETLK
@@ -424,6 +433,16 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		uint32_t, message_id,
 		uint64_t, first_entry_index,
 		std::vector<DirectoryEntry>, dir_entry)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetReserved, LIZ_MATOCL_FUSE_GETRESERVED, 0,
+		uint32_t, msgid,
+		std::vector<NamedInodeEntry>, entries)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetTrash, LIZ_MATOCL_FUSE_GETTRASH, 0,
+		uint32_t, msgid,
+		std::vector<NamedInodeEntry>, entries)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, listTasks, LIZ_MATOCL_LIST_TASKS, 0,

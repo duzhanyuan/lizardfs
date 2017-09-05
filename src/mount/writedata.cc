@@ -1,5 +1,5 @@
 /*
- Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013 Skytechnology sp. z o.o..
+ Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2017 Skytechnology sp. z o.o..
 
  This file was part of MooseFS and is part of LizardFS.
 
@@ -38,6 +38,7 @@
 
 #include "common/crc.h"
 #include "common/datapack.h"
+#include "common/exceptions.h"
 #include "common/goal.h"
 #include "common/massert.h"
 #include "common/message_receive_buffer.h"
@@ -50,7 +51,6 @@
 #include "common/time_utils.h"
 #include "devtools/request_log.h"
 #include "mount/chunk_writer.h"
-#include "mount/exceptions.h"
 #include "mount/global_chunkserver_stats.h"
 #include "mount/mastercomm.h"
 #include "mount/readdata.h"
@@ -58,10 +58,6 @@
 #include "mount/write_cache_block.h"
 #include "protocol/cltocs.h"
 #include "protocol/MFSCommunication.h"
-
-#ifndef EDQUOT
-#define EDQUOT ENOSPC
-#endif
 
 #define IDLE_CONNECTION_TIMEOUT 6
 #define IDHASHSIZE 256
@@ -353,9 +349,8 @@ void write_job_delayed_end(inodedata* id, int status, int seconds, Glock &lock) 
 	LOG_AVG_TILL_END_OF_SCOPE0("write_job_delayed_end");
 	LOG_AVG_TILL_END_OF_SCOPE1("write_job_delayed_end#sec", seconds);
 	id->locator.reset();
-	if (status) {
-		errno = status;
-		lzfs_pretty_syslog(LOG_WARNING, "error writing file number %" PRIu32 ": %s", id->inode, strerr(errno));
+	if (status != LIZARDFS_STATUS_OK) {
+		lzfs_pretty_syslog(LOG_WARNING, "error writing file number %" PRIu32 ": %s", id->inode, lizardfs_error_string(status));
 		id->status = status;
 	}
 	status = id->status;
@@ -363,7 +358,7 @@ void write_job_delayed_end(inodedata* id, int status, int seconds, Glock &lock) 
 		// Don't sleep if we have to write all the data immediately
 		seconds = 0;
 	}
-	if (!id->dataChain.empty() && status == 0) { // still have some work to do
+	if (!id->dataChain.empty() && status == LIZARDFS_STATUS_OK) { // still have some work to do
 		id->trycnt = 0; // on good write reset try counter
 		write_delayed_enqueue(id, seconds, lock);
 	} else {        // no more work or error occurred
@@ -424,7 +419,7 @@ void InodeChunkWriter::processJob(inodedata* inodeData) {
 		// This should never happen, so the status doesn't really matter
 		lzfs_pretty_syslog(LOG_WARNING, "got inode with no data to write!!!");
 		haveDataToWrite = false;
-		status = EINVAL;
+		status = LIZARDFS_ERROR_EINVAL;
 	}
 	if (status != LIZARDFS_STATUS_OK) {
 		write_job_end(inodeData_, status, lock);
@@ -502,13 +497,13 @@ void InodeChunkWriter::processJob(inodedata* inodeData) {
 	} catch (UnrecoverableWriteException& e) {
 		Glock lock(gMutex);
 		if (e.status() == LIZARDFS_ERROR_ENOENT) {
-			write_job_end(inodeData_, EBADF, lock);
+			write_job_end(inodeData_, LIZARDFS_ERROR_EBADF, lock);
 		} else if (e.status() == LIZARDFS_ERROR_QUOTA) {
-			write_job_end(inodeData_, EDQUOT, lock);
+			write_job_end(inodeData_, LIZARDFS_ERROR_QUOTA, lock);
 		} else if (e.status() == LIZARDFS_ERROR_NOSPACE || e.status() == LIZARDFS_ERROR_NOCHUNKSERVERS) {
-			write_job_end(inodeData_, ENOSPC, lock);
+			write_job_end(inodeData_, LIZARDFS_ERROR_NOSPACE, lock);
 		} else {
-			write_job_end(inodeData_, EIO, lock);
+			write_job_end(inodeData_, LIZARDFS_ERROR_IO, lock);
 		}
 	} catch (Exception& e) {
 		Glock lock(gMutex);
@@ -780,7 +775,7 @@ int write_blocks(inodedata *id, uint64_t offset, uint32_t size, const uint8_t* d
 	while (size > 0) {
 		if (size > MFSBLOCKSIZE - from) {
 			if (write_block(id, chindx, pos, from, MFSBLOCKSIZE, data) < 0) {
-				return EIO;
+				return LIZARDFS_ERROR_IO;
 			}
 			size -= (MFSBLOCKSIZE - from);
 			data += (MFSBLOCKSIZE - from);
@@ -792,7 +787,7 @@ int write_blocks(inodedata *id, uint64_t offset, uint32_t size, const uint8_t* d
 			}
 		} else {
 			if (write_block(id, chindx, pos, from, from + size, data) < 0) {
-				return EIO;
+				return LIZARDFS_ERROR_IO;
 			}
 			size = 0;
 		}
@@ -805,12 +800,12 @@ int write_data(void *vid, uint64_t offset, uint32_t size, const uint8_t* data) {
 	int status;
 	inodedata *id = (inodedata*) vid;
 	if (id == NULL) {
-		return EIO;
+		return LIZARDFS_ERROR_IO;
 	}
 
 	Glock lock(gMutex);
 	status = id->status;
-	if (status == 0) {
+	if (status == LIZARDFS_STATUS_OK) {
 		if (offset + size > id->maxfleng) {     // move fleng
 			id->maxfleng = offset + size;
 		}
@@ -822,7 +817,7 @@ int write_data(void *vid, uint64_t offset, uint32_t size, const uint8_t* data) {
 	}
 	lock.unlock();
 
-	if (status != 0) {
+	if (status != LIZARDFS_STATUS_OK) {
 		return status;
 	}
 
@@ -865,7 +860,7 @@ void* write_data_new(uint32_t inode) {
 static int write_data_flush(void* vid, Glock& lock) {
 	inodedata* id = (inodedata*) vid;
 	if (id == NULL) {
-		return EIO;
+		return LIZARDFS_ERROR_IO;
 	}
 
 	write_data_flushwaiting_increase(id, lock);
@@ -915,7 +910,7 @@ int write_data_truncate(uint32_t inode, bool opened, uint32_t uid, uint32_t gid,
 	// 1. Flush writes but don't finish it completely - it'll be done at the end of truncate
 	inodedata* id = write_get_inodedata(inode, lock);
 	if (id == NULL) {
-		return EIO;
+		return LIZARDFS_ERROR_IO;
 	}
 	write_data_lcnt_increase(id, lock);
 	write_data_flushwaiting_increase(id, lock); // this will block any writing to this inode
@@ -939,7 +934,7 @@ int write_data_truncate(uint32_t inode, bool opened, uint32_t uid, uint32_t gid,
 		status = fs_truncate(inode, opened, uid, gid, length, writeNeeded, attr, oldLength, lockId);
 		if (status != LIZARDFS_STATUS_OK) {
 			lzfs_pretty_syslog(LOG_INFO, "truncate file %" PRIu32 " to length %" PRIu64 ": %s (try %d/%d)",
-					inode, length, mfsstrerr(status), int(retries + 1), int(maxretries));
+					inode, length, lizardfs_error_string(status), int(retries + 1), int(maxretries));
 		}
 		if (retries >= maxretries) {
 			break;
@@ -1017,7 +1012,7 @@ int write_data_end(void* vid) {
 	Glock lock(gMutex);
 	inodedata* id = (inodedata*) vid;
 	if (id == NULL) {
-		return EIO;
+		return LIZARDFS_ERROR_IO;
 	}
 	int status = write_data_flush(id, lock);
 	write_data_lcnt_decrease(id, lock);

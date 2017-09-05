@@ -2,7 +2,7 @@
 
 Summary:        LizardFS - distributed, fault tolerant file system
 Name:           lizardfs
-Version:        3.11.0
+Version:        3.12.0
 Release:        0%{?distro}
 License:        GPL v3
 Group:          System Environment/Daemons
@@ -80,6 +80,13 @@ Requires:       bash-completion
 
 %description client
 LizardFS client: mfsmount and mfstools.
+
+%package lib-client
+Summary:        LizardFS client C/C++ library
+Group:          Development/Libraries
+
+%description lib-client
+LizardFS client library for C/C++ bindings.
 
 %package cgi
 Summary:        LizardFS CGI Monitor
@@ -373,7 +380,6 @@ rm -rf $RPM_BUILD_ROOT
 %doc NEWS README UPGRADE
 %attr(755,root,root) %{_bindir}/lizardfs
 %attr(755,root,root) %{_bindir}/mfsmount
-%attr(755,root,root) %{_bindir}/mfssnapshot
 %attr(755,root,root) %{_bindir}/mfstools.sh
 %{_bindir}/mfsappendchunks
 %{_bindir}/mfscheckfile
@@ -424,6 +430,16 @@ rm -rf $RPM_BUILD_ROOT
 %{liz_confdir}/iolimits.cfg.dist
 %{_sysconfdir}/bash_completion.d/lizardfs
 
+%files lib-client
+%{_libdir}/liblizardfsmount_shared.so
+%{_libdir}/liblizardfs-client.so
+%{_libdir}/liblizardfs-client-cpp.a
+%{_libdir}/liblizardfs-client-cpp_pic.a
+%{_libdir}/liblizardfs-client.a
+%{_libdir}/liblizardfs-client_pic.a
+%{_includedir}/lizardfs/lizardfs_c_api.h
+%{_includedir}/lizardfs/lizardfs_error_codes.h
+
 %files cgi
 %defattr(644,root,root,755)
 %doc NEWS README UPGRADE
@@ -458,6 +474,9 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man8/lizardfs-probe.8*
 
 %changelog
+* Thu May 11 2017 Artur Kornacki <contact@lizardfs.org> - 3.12.0-devel
+- (none) None
+
 * Tue May 9 2017 Piotr Sarna <contact@lizardfs.org> - 3.11.0
 - (master) improve ACL implementation
 - (master) add option to avoid same-ip chunkserver replication

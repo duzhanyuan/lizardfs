@@ -1,5 +1,5 @@
 /*
-   Copyright 2013-2015 Skytechnology sp. z o.o.
+   Copyright 2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -16,23 +16,19 @@
    along with LizardFS. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#pragma once
+
 #include "common/platform.h"
-#include "common/list.h"
+#include "protocol/MFSCommunication.h"
 
-#include <gtest/gtest.h>
+#include <array>
 
-struct SophisticatedList {
-	char dummy1;
-	uint32_t dummy2;
-	SophisticatedList* next;
-};
-
-TEST(ListTests, ListLength) {
-	SophisticatedList l1;
-	EXPECT_EQ(0u, list_length((SophisticatedList*) NULL));
-	l1.next = NULL;
-	EXPECT_EQ(1u, list_length(&l1));
-	SophisticatedList l2;
-	l2.next = &l1;
-	EXPECT_EQ(2u, list_length(&l2));
+inline const char *sugidClearModeString(SugidClearMode mode) {
+	static std::array<const char *, 6> sugid_strings = {{
+		"NEVER", "ALWAYS", "OSX", "BSD", "EXT", "XFS"
+	}};
+	if ((unsigned)mode >= sugid_strings.size()) {
+		return "???";
+	}
+	return sugid_strings[(int)mode];
 }

@@ -23,6 +23,7 @@
 #include "master/filesystem_node_types.h"
 #include "master/filesystem_metadata.h"
 #include "protocol/directory_entry.h"
+#include "protocol/named_inode_entry.h"
 
 inline uint32_t fsnodes_hash(uint32_t parentid, const hstorage::Handle &name) {
 	return (parentid * 0x5F2318BD) + name.hash();
@@ -118,8 +119,10 @@ std::string fsnodes_escape_name(const std::string &name);
 int fsnodes_purge(uint32_t ts, FSNode *p);
 uint32_t fsnodes_getdetachedsize(const TrashPathContainer &data);
 void fsnodes_getdetacheddata(const TrashPathContainer &data, uint8_t *dbuff);
+void fsnodes_getdetacheddata(const TrashPathContainer &data, uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries);
 uint32_t fsnodes_getdetachedsize(const ReservedPathContainer &data);
 void fsnodes_getdetacheddata(const ReservedPathContainer &data, uint8_t *dbuff);
+void fsnodes_getdetacheddata(const ReservedPathContainer &data, uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries);
 void fsnodes_getpath(FSNodeDirectory *parent, FSNode *child, std::string &path);
 void fsnodes_fill_attr(FSNode *node, FSNode *parent, uint32_t uid, uint32_t gid, uint32_t auid,
 	uint32_t agid, uint8_t sesflags, Attributes &attr);
@@ -186,8 +189,9 @@ void fsnodes_seteattr_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint8_t
 	uint32_t *nsinodes);
 uint8_t fsnodes_deleteacl(FSNode *p, AclType type, uint32_t ts);
 
-uint8_t fsnodes_setacl(FSNode *p, AclType type, AccessControlList acl, uint32_t ts);
-uint8_t fsnodes_getacl(FSNode *p, AclType type, AccessControlList &acl);
+uint8_t fsnodes_setacl(FSNode *p, const RichACL &acl, uint32_t ts);
+uint8_t fsnodes_setacl(FSNode *p, AclType type, const AccessControlList &acl, uint32_t ts);
+uint8_t fsnodes_getacl(FSNode *p, RichACL &acl);
 
 uint32_t fsnodes_getpath_size(FSNodeDirectory *parent, FSNode *child);
 void fsnodes_getpath_data(FSNodeDirectory *parent, FSNode *child, uint8_t *path, uint32_t size);

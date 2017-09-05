@@ -1,5 +1,5 @@
 /*
-   Copyright 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o.
+   Copyright 2017 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -20,14 +20,8 @@
 
 #include "common/platform.h"
 
-#include <stdlib.h>
-#include <cstdint>
+#include "common/serialization_macros.h"
 
-template<class MooseFSStyleList>
-uint32_t list_length(MooseFSStyleList* list) {
-	uint32_t result = 0;
-	for (auto element = list; element != NULL; element = element->next) {
-		++result;
-	}
-	return result;
-}
+LIZARDFS_DEFINE_SERIALIZABLE_CLASS(NamedInodeEntry,
+	std::string, name,
+	uint32_t, inode);

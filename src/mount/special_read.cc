@@ -25,19 +25,19 @@
 using namespace LizardClient;
 
 static void printDebugReadInfo(Inode ino, uint64_t size, uint64_t off) {
-	fprintf(stderr,"read from inode %lu up to %" PRIu64 " bytes from position %" PRIu64 "\n",
-	        ino, size, off);
+	fprintf(stderr,"read from inode %u up to %" PRIu64 " bytes from position %" PRIu64 "\n",
+	        (unsigned int)ino, size, off);
 }
 
 static void printReadOplogOk(const Context &ctx, Inode ino, uint64_t size, uint64_t off,
 	                            unsigned long int size_read) {
-	oplog_printf(ctx, "read (%lu,%" PRIu64 ",%" PRIu64 "): OK (%lu)",
-	            (unsigned long int)ino, size, off, size_read);
+	oplog_printf(ctx, "read (%u,%" PRIu64 ",%" PRIu64 "): OK (%lu)",
+	            (unsigned int)ino, size, off, size_read);
 }
 
 static void printReadOplogNoData(const Context &ctx, Inode ino, uint64_t size, uint64_t off) {
-	oplog_printf(ctx, "read (%lu,%" PRIu64 ",%" PRIu64 "): OK (no data)",
-	            (unsigned long int)ino, size, off);
+	oplog_printf(ctx, "read (%u,%" PRIu64 ",%" PRIu64 "): OK (no data)",
+	            (unsigned int)ino, size, off);
 }
 
 namespace InodeMasterInfo {
@@ -216,7 +216,7 @@ std::vector<uint8_t> special_read(Inode ino, const Context &ctx, size_t size, of
 	if (!func) {
 		lzfs_pretty_syslog(LOG_WARNING,
 			"Trying to call unimplemented 'read' function for special inode");
-		throw RequestException(EINVAL);
+		throw RequestException(LIZARDFS_ERROR_EINVAL);
 	}
 	return func(ctx, size, off, fi, debug_mode);
 }

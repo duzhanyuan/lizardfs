@@ -28,9 +28,11 @@
 #include "common/attributes.h"
 #include "common/chunk_type_with_address.h"
 #include "mount/group_cache.h"
+#include "mount/lizard_client.h"
 #include "protocol/packet.h"
 #include "protocol/lock_info.h"
 #include "protocol/directory_entry.h"
+#include "protocol/named_inode_entry.h"
 
 void fs_getmasterlocation(uint8_t loc[14]);
 uint32_t fs_getsrcip(void);
@@ -39,8 +41,7 @@ void fs_notify_sendremoved(uint32_t cnt,uint32_t *inodes);
 
 void fs_statfs(uint64_t *totalspace,uint64_t *availspace,uint64_t *trashspace,uint64_t *reservedspace,uint32_t *inodes);
 uint8_t fs_access(uint32_t inode,uint32_t uid,uint32_t gid,uint8_t modemask);
-uint8_t fs_lookup(uint32_t parent, uint8_t nleng, const uint8_t *name, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr);
-uint8_t fs_whole_path_lookup(uint32_t parent, const std::string &name, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr);
+uint8_t fs_lookup(uint32_t parent, const std::string &path, uint32_t uid, uint32_t gid, uint32_t *inode, Attributes &attr);
 uint8_t fs_getattr(uint32_t inode, uint32_t uid, uint32_t gid, Attributes &attr);
 uint8_t fs_setattr(uint32_t inode, uint32_t uid, uint32_t gid, uint8_t setmask, uint16_t attrmode, uint32_t attruid, uint32_t attrgid, uint32_t attratime, uint32_t attrmtime, uint8_t sugidclearmode, Attributes &attr);
 uint8_t fs_truncate(uint32_t inode, bool opened, uint32_t uid, uint32_t gid, uint64_t length,
@@ -79,11 +80,16 @@ uint8_t fs_setxattr(uint32_t inode,uint8_t opened,uint32_t uid,uint32_t gid,uint
 uint8_t fs_removexattr(uint32_t inode,uint8_t opened,uint32_t uid,uint32_t gid,uint8_t nleng,const uint8_t *name);
 
 uint8_t fs_deletacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type);
-uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, AccessControlList& acl);
+uint8_t fs_getacl(uint32_t inode, uint32_t uid, uint32_t gid, RichACL& acl, uint32_t &owner_id);
+uint8_t fs_setacl(uint32_t inode, uint32_t uid, uint32_t gid, const RichACL& acl);
 uint8_t fs_setacl(uint32_t inode, uint32_t uid, uint32_t gid, AclType type, const AccessControlList& acl);
 
 uint8_t fs_getreserved(const uint8_t **dbuff,uint32_t *dbuffsize);
+uint8_t fs_getreserved(LizardClient::NamedInodeOffset off, LizardClient::NamedInodeOffset max_entries,
+	               std::vector<NamedInodeEntry> &entries);
 uint8_t fs_gettrash(const uint8_t **dbuff,uint32_t *dbuffsize);
+uint8_t fs_gettrash(LizardClient::NamedInodeOffset off, LizardClient::NamedInodeOffset max_entries,
+	            std::vector<NamedInodeEntry> &entries);
 uint8_t fs_getdetachedattr(uint32_t inode, Attributes &attr);
 uint8_t fs_gettrashpath(uint32_t inode,const uint8_t **path);
 uint8_t fs_settrashpath(uint32_t inode,const uint8_t *path);
@@ -98,16 +104,20 @@ uint8_t fs_flock_recv();
 void fs_flock_interrupt(const lzfs_locks::InterruptData &data);
 void fs_setlk_interrupt(const lzfs_locks::InterruptData &data);
 
+uint8_t fs_makesnapshot(uint32_t src_inode, uint32_t dst_parent, const std::string &dst_name,
+	                uint32_t uid, uint32_t gid, uint8_t can_overwrite, uint32_t &job_id);
+uint8_t fs_getgoal(uint32_t inode, std::string &goal);
+uint8_t fs_setgoal(uint32_t inode, uint32_t uid, const std::string &goal_name, uint8_t smode);
+
 uint8_t fs_custom(MessageBuffer& buffer);
 uint8_t fs_raw_sendandreceive(MessageBuffer& buffer, PacketHeader::Type expectedType);
 uint8_t fs_send_custom(MessageBuffer buffer);
+uint8_t fs_getchunksinfo(uint32_t uid, uint32_t gid, uint32_t inode, uint32_t chunk_index,
+		uint32_t chunk_count, std::vector<ChunkWithAddressAndLabel> &chunks);
+uint8_t fs_getchunkservers(std::vector<ChunkserverListEntry> &chunkservers);
 
-// called before fork
-int fs_init_master_connection(const char *bindhostname, const char *masterhostname,
-		const char *masterportname, uint8_t meta, const char *info, const char *subfolder,
-		const uint8_t passworddigest[16], uint8_t donotrememberpassword, uint8_t bgregister,
-		unsigned retries, unsigned reportreservedperiod);
 // called after fork
+int fs_init_master_connection(LizardClient::FsInitParams &params);
 void fs_init_threads(uint32_t retries);
 void fs_term(void);
 

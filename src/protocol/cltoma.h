@@ -26,6 +26,7 @@
 #include "common/acl_type.h"
 #include "common/legacy_acl.h"
 #include "common/moosefs_string.h"
+#include "common/richacl.h"
 #include "common/serialization_macros.h"
 #include "common/small_vector.h"
 #include "protocol/lock_info.h"
@@ -82,7 +83,8 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		AclType, type)
 
 LIZARDFS_DEFINE_PACKET_VERSION(cltoma, fuseSetAcl, kLegacyACL, 0)
-LIZARDFS_DEFINE_PACKET_VERSION(cltoma, fuseSetAcl, kCurrentACL, 1)
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, fuseSetAcl, kPosixACL, 1)
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, fuseSetAcl, kRichACL, 2)
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, kLegacyACL,
 		uint32_t, messageId,
@@ -92,13 +94,20 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		AclType, type,
 		legacy::AccessControlList, acl)
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, kCurrentACL,
+		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, kPosixACL,
 		uint32_t, messageId,
 		uint32_t, inode,
 		uint32_t, uid,
 		uint32_t, gid,
 		AclType, type,
 		AccessControlList, acl)
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, fuseSetAcl, LIZ_CLTOMA_FUSE_SET_ACL, kRichACL,
+		uint32_t, messageId,
+		uint32_t, inode,
+		uint32_t, uid,
+		uint32_t, gid,
+		RichACL, acl)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, iolimit, LIZ_CLTOMA_IOLIMIT, 0,
@@ -180,16 +189,28 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		bool, regularChunksOnly)
 
 // LIZ_CLTOMA_CSERV_LIST
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, cservList, kStandard, 0)
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, cservList, kWithMessageId, 1)
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		cltoma, cservList, LIZ_CLTOMA_CSERV_LIST, 0,
+		cltoma, cservList, LIZ_CLTOMA_CSERV_LIST, kStandard,
+		bool, dummy)
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, cservList, LIZ_CLTOMA_CSERV_LIST, kWithMessageId,
+		uint32_t, message_id,
 		bool, dummy)
 
 // LIZ_CLTOMA_CHUNK_INFO
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, chunksInfo, kSingleChunk, 0) // deprecated
+LIZARDFS_DEFINE_PACKET_VERSION(cltoma, chunksInfo, kMultiChunk, 1)
+
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
-		cltoma, chunkInfo, LIZ_CLTOMA_CHUNK_INFO, 0,
-		uint32_t, messageId,
+		cltoma, chunksInfo, LIZ_CLTOMA_CHUNKS_INFO, kMultiChunk,
+		uint32_t, message_id,
+		uint32_t, uid,
+		uint32_t, gid,
 		uint32_t, inode,
-		uint32_t, chunkIndex)
+		uint32_t, chunk_index,
+		uint32_t, chunk_count)
 
 // LIZ_CLTOMA_HOSTNAME
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
@@ -271,7 +292,7 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, fuseGetlk, LIZ_CLTOMA_FUSE_GETLK, 0,
-		uint32_t, messageId,
+		uint32_t, message_id,
 		uint32_t, inode,
 		uint64_t, owner,
 		lzfs_locks::FlockWrapper, lock)
@@ -349,6 +370,16 @@ LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetDir, LIZ_CLTOMA_FUSE_GETDIR,
 		uint32_t, gid,
 		uint64_t, first_entry,
 		uint64_t, number_of_entries)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetReserved, LIZ_CLTOMA_FUSE_GETRESERVED, 0,
+		uint32_t, msgid,
+		uint32_t, off,
+		uint32_t, max_entries)
+
+LIZARDFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetTrash, LIZ_CLTOMA_FUSE_GETTRASH, 0,
+		uint32_t, msgid,
+		uint32_t, off,
+		uint32_t, max_entries)
 
 LIZARDFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, listTasks, LIZ_CLTOMA_LIST_TASKS, 0,

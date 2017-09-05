@@ -1,43 +1,10 @@
+include(DownloadExternal)
+
 # Download GoogleTest
 if(ENABLE_TESTS)
-  set(GTEST_VERSION 1.7.0)
-  set(GTEST_NAME googletest-release-${GTEST_VERSION})
-
-  if(NOT IS_DIRECTORY ${CMAKE_SOURCE_DIR}/external/${GTEST_NAME})
-    set(GTEST_ARCHIVE release-${GTEST_VERSION}.zip)
-    set(GTEST_URL https://github.com/google/googletest/archive/${GTEST_ARCHIVE})
-    set(GTEST_ARCHIVE_MD5 ef5e700c8a0f3ee123e2e0209b8b4961)
-
-    message(STATUS "Downloading ${GTEST_URL}...")
-    file(DOWNLOAD
-        ${GTEST_URL}
-        ${CMAKE_BINARY_DIR}/${GTEST_ARCHIVE}
-        INACTIVITY_TIMEOUT 15
-        SHOW_PROGRESS
-        STATUS DOWNLOAD_STATUS
-        EXPECTED_MD5 ${GTEST_ARCHIVE_MD5})
-
-    list(GET DOWNLOAD_STATUS 0 DOWNLOAD_CODE)
-    if(NOT DOWNLOAD_CODE EQUAL 0)
-      list(GET DOWNLOAD_STATUS 1 DOWNLOAD_MESSAGE)
-      message(FATAL_ERROR "Download ${GTEST_URL} error ${DOWNLOAD_CODE}: ${DOWNLOAD_MESSAGE}")
-    endif()
-
-    message(STATUS "Unpacking ${GTEST_ARCHIVE}...")
-    execute_process(COMMAND unzip -q ${CMAKE_BINARY_DIR}/${GTEST_ARCHIVE}
-      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/external
-      RESULT_VARIABLE UNZIP_ERROR
-      ERROR_VARIABLE UNZIP_ERROR_MESSAGE)
-    if(NOT UNZIP_ERROR STREQUAL 0)
-    message(FATAL_ERROR "unzip ${GTEST_ARCHIVE} failed: ${UNZIP_ERROR} ${UNZIP_ERROR_MESSAGE}")
-    endif()
-    if(NOT IS_DIRECTORY ${CMAKE_SOURCE_DIR}/external/${GTEST_NAME})
-      message(FATAL_ERROR "Extracting ${GTEST_ARCHIVE} didn't produce directory '${GTEST_NAME}'")
-    endif()
-    message(STATUS "Downloading ${GTEST_NAME} finished successfully")
-  else()
-    message(STATUS "Found ${GTEST_NAME}")
-  endif()
+  download_external(GTEST "googletest-release-1.7.0"
+                    "https://github.com/google/googletest/archive/release-1.7.0.zip"
+                    "ef5e700c8a0f3ee123e2e0209b8b4961")
 endif()
 
 # Find standard libraries
@@ -138,7 +105,7 @@ endif()
 
 # Find GoogleTest
 if(ENABLE_TESTS)
-  set(GTEST_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/external/${GTEST_NAME}/include)
+  set(GTEST_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/external/${GTEST_DIR_NAME}/include)
   set(TEST_LIBRARIES "" CACHE INTERNAL "" FORCE)
 endif()
 
@@ -160,5 +127,12 @@ find_package(DB 11.2.5.2)
 
 # Find Intel Storage Acceleration library
 find_library(ISAL_LIBRARY isal)
+find_library(ISAL_PIC_LIBRARY isal.so)
+if (NOT ISAL_PIC_LIBRARY)
+  find_library(ISAL_PIC_LIBRARY isal_pic)
+endif()
+if (NOT ISAL_PIC_LIBRARY)
+  message(WARNING "Some systems may require position-independent ISA-L library.")
+endif()
 message(STATUS "ISAL(Intel Storage Acceleration) LIBRARY: ${ISAL_LIBRARY}")
-
+message(STATUS "ISAL PIC LIBRARY: ${ISAL_PIC_LIBRARY}")

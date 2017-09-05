@@ -92,36 +92,11 @@ void fs_background_task_manager_work() {
 	}
 }
 
-std::vector<DefectiveFileInfo> fs_get_defective_nodes_info(uint8_t requested_flags, uint64_t max_entries,
-	                                                   uint64_t &entry_index) {
-	FSNode *node;
-	FSNodeDirectory *parent;
-	std::string file_path;
-	std::vector<DefectiveFileInfo> defective_nodes_info;
-	ActiveLoopWatchdog watchdog;
-	defective_nodes_info.reserve(max_entries);
-	auto it = gDefectiveNodes.find_nth(entry_index);
-	watchdog.start();
-	for (uint64_t i = 0; i < max_entries && it != gDefectiveNodes.end(); ++it) {
-		if (((*it).second & requested_flags) != 0) {
-			node = fsnodes_id_to_node<FSNode>((*it).first);
-			parent = fsnodes_get_first_parent(node);
-			fsnodes_getpath(parent, node, file_path);
-			file_path = "/" + file_path;
-			defective_nodes_info.emplace_back(file_path, (*it).second);
-			++i;
-		}
-		++entry_index;
-		if (watchdog.expired()) {
-			return defective_nodes_info;
-		}
-	}
-	entry_index = 0;
-	return defective_nodes_info;
-}
-
 static std::string get_node_info(FSNode *node) {
 	std::string name;
+	if (node == nullptr) {
+		return name;
+	}
 	if (node->type == FSNode::kTrash) {
 		name = "file in trash " + std::to_string(node->id) + ": " +
 		       (std::string)gMetadata->trash.at(TrashPathKey(node));
@@ -157,6 +132,30 @@ static std::string get_node_info(FSNode *node) {
 	return fsnodes_escape_name(name);
 }
 
+std::vector<DefectiveFileInfo> fs_get_defective_nodes_info(uint8_t requested_flags, uint64_t max_entries,
+	                                                   uint64_t &entry_index) {
+	FSNode *node;
+	std::vector<DefectiveFileInfo> defective_nodes_info;
+	ActiveLoopWatchdog watchdog;
+	defective_nodes_info.reserve(max_entries);
+	auto it = gDefectiveNodes.find_nth(entry_index);
+	watchdog.start();
+	for (uint64_t i = 0; i < max_entries && it != gDefectiveNodes.end(); ++it) {
+		if (((*it).second & requested_flags) != 0) {
+			node = fsnodes_id_to_node<FSNode>((*it).first);
+			std::string info = get_node_info(node);
+			defective_nodes_info.emplace_back(std::move(info), (*it).second);
+			++i;
+		}
+		++entry_index;
+		if (watchdog.expired()) {
+			return defective_nodes_info;
+		}
+	}
+	entry_index = 0;
+	return defective_nodes_info;
+}
+
 void fs_test_getdata(uint32_t &loopstart, uint32_t &loopend, uint32_t &files, uint32_t &ugfiles,
 		uint32_t &mfiles, uint32_t &chunks, uint32_t &ugchunks, uint32_t &mchunks,
 		std::string &result) {
@@ -169,6 +168,12 @@ void fs_test_getdata(uint32_t &loopstart, uint32_t &loopend, uint32_t &files, ui
 		}
 
 		FSNode *node = fsnodes_id_to_node<FSNode>(entry.first);
+		if (!node) {
+			report << "Structure error in defective list, entry " << std::to_string(entry.first) << "\n";
+			errors++;
+			continue;
+		}
+
 		if (node->type == FSNode::kFile || node->type == FSNode::kTrash ||
 		    node->type == FSNode::kReserved) {
 			FSNodeFile *file_node = static_cast<FSNodeFile *>(node);
@@ -209,6 +214,7 @@ void fs_test_getdata(uint32_t &loopstart, uint32_t &loopend, uint32_t &files, ui
 				report << "*";
 			}
 			report << " currently unavailable " << name << "\n";
+			errors++;
 		}
 
 		if (errors >= ERRORS_LOG_MAX) {
@@ -218,6 +224,7 @@ void fs_test_getdata(uint32_t &loopstart, uint32_t &loopend, uint32_t &files, ui
 		if (entry.second & kStructureError) {
 			std::string name = get_node_info(node);
 			report << "Structure error in " << name << "\n";
+			errors++;
 		}
 
 		if (errors >= ERRORS_LOG_MAX) {
@@ -332,9 +339,6 @@ void fs_process_file_test() {
 	static uint32_t unavailreservedfiles = 0;
 
 	FSNode *f;
-	if (eventloop_time() <= gTestStartTime) {
-		return;
-	}
 
 	if (gFileTestLoopIndex == 0) {
 		fsinfo_files = files;
@@ -367,6 +371,11 @@ void fs_process_file_test() {
 	watchdog.start();
 	for (k = 0; k < gFileTestLoopBucketLimit && gFileTestLoopIndex < NODEHASHSIZE;
 	     k++, gFileTestLoopIndex++) {
+		if (k > 0 && watchdog.expired()) {
+			gFileTestLoopBucketLimit -= k;
+			return;
+		}
+
 		for (f = gMetadata->nodehash[gFileTestLoopIndex]; f; f = f->next) {
 			node_error_flag = 0;
 
@@ -460,11 +469,6 @@ void fs_process_file_test() {
 				}
 			}
 		}
-
-		if (watchdog.expired()) {
-			gFileTestLoopBucketLimit -= k;
-			return;
-		}
 	}
 
 	gFileTestLoopBucketLimit -= k;
@@ -474,6 +478,11 @@ void fs_process_file_test() {
 }
 
 void fs_periodic_file_test() {
+	if (eventloop_time() <= gTestStartTime) {
+		gFileTestLoopBucketLimit = 0;
+		return;
+	}
+
 	if (gFileTestLoopBucketLimit == 0) {
 		gFileTestLoopBucketLimit = NODEHASHSIZE / gFileTestLoopTime;
 		fs_process_file_test();
@@ -486,6 +495,13 @@ void fs_background_file_test(void) {
 		if (gFileTestLoopBucketLimit > 0) {
 			eventloop_make_next_poll_nonblocking();
 		}
+	}
+}
+
+void fsnodes_periodic_remove(uint32_t inode) {
+	auto it = gDefectiveNodes.find(inode);
+	if (it != gDefectiveNodes.end()) {
+		gDefectiveNodes.erase(it);
 	}
 }
 #endif
@@ -575,7 +591,7 @@ uint8_t fs_apply_emptyreserved_deprecated(uint32_t /*ts*/,uint32_t /*freeinodes*
 
 #ifndef METARESTORE
 void fs_read_periodic_config_file() {
-	gFileTestLoopTime = cfg_get_minmaxvalue<uint32_t>("FILE_TEST_LOOP_MIN_TIME", 300, FILETESTSMINLOOPTIME, FILETESTSMAXLOOPTIME);
+	gFileTestLoopTime = cfg_get_minmaxvalue<uint32_t>("FILE_TEST_LOOP_MIN_TIME", 3600, FILETESTSMINLOOPTIME, FILETESTSMAXLOOPTIME);
 }
 
 void fs_periodic_master_init() {
