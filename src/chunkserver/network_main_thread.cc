@@ -42,6 +42,7 @@
 #include "chunkserver/network_main_thread.h"
 #include "chunkserver/network_stats.h"
 #include "chunkserver/network_worker_thread.h"
+#include "chunkserver/chunk_replicator.h"
 #include "common/cfg.h"
 #include "common/charts.h"
 #include "common/event_loop.h"
@@ -76,6 +77,22 @@ static uint32_t gNrOfNetworkWorkers;
 static uint32_t gNrOfHddWorkersPerNetworkWorker;
 static uint32_t gBgjobsCountPerNetworkWorker;
 
+void chunkReplicatorReload() {
+	unsigned rep_total = cfg_get_minmaxvalue<unsigned>("REPLICATION_TOTAL_TIMEOUT_MS",
+	                                                   ChunkReplicator::kDefaultTotalTimeout_ms,
+	                                                   1000, 60 * 60 * 1000);
+	unsigned rep_wave = cfg_get_minmaxvalue<unsigned>("REPLICATION_WAVE_TIMEOUT_MS",
+	                                                  ChunkReplicator::kDefaultWaveTimeout_ms,
+	                                                  50, 30 * 1000);
+	unsigned rep_connection = cfg_get_minmaxvalue<unsigned>("REPLICATION_CONNECTION_TIMEOUT_MS",
+	                                                        ChunkReplicator::kDefaultConnectionTimeout_ms,
+	                                                        200, 30 * 1000);
+
+	gReplicator.setTotalTimeout(rep_total);
+	gReplicator.setWaveTimeout(rep_wave);
+	gReplicator.setConnectionTimeout(rep_connection);
+}
+
 void replicationBandwidthLimitReload() {
 	if (cfg_isdefined("REPLICATION_BANDWIDTH_LIMIT_KBPS")) {
 		replicationBandwidthLimiter().setLimit(cfg_getuint32("REPLICATION_BANDWIDTH_LIMIT_KBPS", 0));
@@ -101,6 +118,7 @@ void mainNetworkThreadReload(void) {
 				"main server module: can't reload REPLICATION_BANDWIDTH_LIMIT_KBPS: %s",
 				ex.what());
 	}
+	chunkReplicatorReload();
 
 	gHDDReadAhead.setReadAhead_kB(
 			cfg_get_maxvalue<uint32_t>("READ_AHEAD_KB", 0, MFSCHUNKSIZE / 1024));
@@ -166,7 +184,7 @@ void mainNetworkThreadDesc(std::vector<pollfd> &pdesc) {
 
 void mainNetworkThreadTerm(void) {
 	TRACETHIS();
-	syslog(LOG_NOTICE, "closing %s:%s", ListenHost, ListenPort);
+	lzfs_pretty_syslog(LOG_NOTICE, "closing %s:%s", ListenHost, ListenPort);
 	tcpclose(lsock);
 
 	free(ListenHost);
@@ -194,7 +212,7 @@ void mainNetworkThreadServe(const std::vector<pollfd> &pdesc) {
 			}
 			if (job_pool_jobs_count(nextNetworkThread->bgJobPool())
 					>= (gBgjobsCountPerNetworkWorker * 9) / 10) {
-				syslog(LOG_WARNING, "jobs queue is full !!!");
+				lzfs_pretty_syslog(LOG_WARNING, "jobs queue is full !!!");
 				tcpclose(newSocketFD);
 			} else {
 				nextNetworkThread->addConnection(newSocketFD);
@@ -247,6 +265,7 @@ int mainNetworkThreadInit(void) {
 	} catch (Exception& e) {
 		throw InitializeException("can't initialize replication bandwidth limiter: " + e.message());
 	}
+	chunkReplicatorReload();
 
 	return 0;
 }

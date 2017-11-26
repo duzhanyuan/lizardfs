@@ -179,7 +179,7 @@ static uint64_t file_realsize(FSNodeFile *node, uint32_t nonzero_chunks, uint64_
 			}
 			full_size += size;
 		} else {
-			syslog(LOG_ERR, "file_realsize: inode %" PRIu32 " has unknown goal 0x%" PRIx8, node->id,
+			lzfs_pretty_syslog(LOG_ERR, "file_realsize: inode %" PRIu32 " has unknown goal 0x%" PRIx8, node->id,
 			       node->goal);
 			return 0;
 		}
@@ -558,13 +558,14 @@ FSNode *fsnodes_create_node(uint32_t ts, FSNodeDirectory *parent, const HString 
 		node->mode = (mode & 07777) | (parent->mode & (0xF000 & (~(EATTR_NOECACHE << 12))));
 	}
 	// If desired, node inherits permissions from parent's default ACL
-	if (inheritacl == AclInheritance::kInheritAcl && parent->acl) {
+	const RichACL *parent_acl = (inheritacl == AclInheritance::kInheritAcl)
+	                       ? gMetadata->acl_storage.get(parent->id) : nullptr;
+	if (parent_acl) {
 		RichACL acl;
 		uint16_t mode = node->mode;
-		if (RichACL::inheritInode(*parent->acl, mode, acl, umask, type == FSNode::kDirectory)) {
-			node->acl.reset(new RichACL(std::move(acl)));
+		if (RichACL::inheritInode(*parent_acl, mode, acl, umask, type == FSNode::kDirectory)) {
+			gMetadata->acl_storage.set(node->id, std::move(acl));
 		}
-
 		// Set effective permissions as the intersection of mode and ACL
 		node->mode &= mode | ~0777;
 	} else {
@@ -655,7 +656,7 @@ void fsnodes_getpath(FSNodeDirectory *parent, FSNode *child, std::string &path) 
 	uint32_t size = fsnodes_getpath_size(parent, child);
 
 	if (size > 65535) {
-		syslog(LOG_WARNING, "path too long !!! - truncate");
+		lzfs_pretty_syslog(LOG_WARNING, "path too long !!! - truncate");
 		size = 65535;
 	}
 
@@ -747,7 +748,7 @@ void fsnodes_getdetacheddata(const TrashPathContainer &data, uint8_t *dbuff)
 }
 
 void fsnodes_getdetacheddata(const TrashPathContainer &data, uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries) {
-#ifdef LIZARDFS_HAVE_JUDY
+#ifdef LIZARDFS_HAVE_64BIT_JUDY
 	auto it = data.find_nth(off);
 #else
 	auto it = off < data.size() ? std::next(data.begin(), off) : data.end();
@@ -766,7 +767,7 @@ void fsnodes_getdetacheddata(const ReservedPathContainer &data, uint8_t *dbuff) 
 }
 
 void fsnodes_getdetacheddata(const ReservedPathContainer &data, uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries) {
-#ifdef LIZARDFS_HAVE_JUDY
+#ifdef LIZARDFS_HAVE_64BIT_JUDY
 	auto it = data.find_nth(off);
 #else
 	auto it = off < data.size() ? std::next(data.begin(), off) : data.end();
@@ -990,7 +991,7 @@ uint8_t fsnodes_appendchunks(uint32_t ts, FSNodeFile *dst, FSNodeFile *src) {
 		auto chunkid = src->chunks[i];
 		if (chunkid > 0) {
 			if (chunk_add_file(chunkid, dst->goal) != LIZARDFS_STATUS_OK) {
-				syslog(LOG_ERR, "structure error - chunk %016" PRIX64 " not found (inode: %" PRIu32
+				lzfs_pretty_syslog(LOG_ERR, "structure error - chunk %016" PRIX64 " not found (inode: %" PRIu32
 				                " ; index: %" PRIu32 ")",
 				       chunkid, src->id, i);
 			}
@@ -1061,7 +1062,7 @@ void fsnodes_setlength(FSNodeFile *obj, uint64_t length) {
 		uint64_t chunkid = obj->chunks[i];
 		if (chunkid > 0) {
 			if (chunk_delete_file(chunkid, obj->goal) != LIZARDFS_STATUS_OK) {
-				syslog(LOG_ERR, "structure error - chunk %016" PRIX64 " not found (inode: %" PRIu32
+				lzfs_pretty_syslog(LOG_ERR, "structure error - chunk %016" PRIX64 " not found (inode: %" PRIu32
 				                " ; index: %" PRIu32 ")",
 				       chunkid, obj->id, i);
 			}
@@ -1116,6 +1117,7 @@ static inline void fsnodes_remove_node(uint32_t ts, FSNode *toremove) {
 	removeFromChecksum(gMetadata->fsNodesChecksum, toremove->checksum);
 	// and free
 	gMetadata->nodes--;
+	gMetadata->acl_storage.erase(toremove->id);
 	if (toremove->type == FSNode::kDirectory) {
 		gMetadata->dirnodes--;
 	}
@@ -1127,7 +1129,7 @@ static inline void fsnodes_remove_node(uint32_t ts, FSNode *toremove) {
 			uint64_t chunkid = static_cast<FSNodeFile*>(toremove)->chunks[i];
 			if (chunkid > 0) {
 				if (chunk_delete_file(chunkid, toremove->goal) != LIZARDFS_STATUS_OK) {
-					syslog(LOG_ERR, "structure error - chunk %016" PRIX64
+					lzfs_pretty_syslog(LOG_ERR, "structure error - chunk %016" PRIX64
 					                " not found (inode: %" PRIu32
 					                " ; index: %" PRIu32 ")",
 					       chunkid, toremove->id, i);
@@ -1356,14 +1358,14 @@ void fsnodes_getgoal_recursive(FSNode *node, uint8_t gmode, GoalStatistics &fgta
 		GoalStatistics &dgtab) {
 	if (node->type == FSNode::kFile || node->type == FSNode::kTrash || node->type == FSNode::kReserved) {
 		if (!GoalId::isValid(node->goal)) {
-			syslog(LOG_WARNING, "file inode %" PRIu32 ": unknown goal !!! - fixing",
+			lzfs_pretty_syslog(LOG_WARNING, "file inode %" PRIu32 ": unknown goal !!! - fixing",
 			       node->id);
 			fsnodes_changefilegoal(static_cast<FSNodeFile*>(node), DEFAULT_GOAL);
 		}
 		fgtab[node->goal]++;
 	} else if (node->type == FSNode::kDirectory) {
 		if (!GoalId::isValid(node->goal)) {
-			syslog(LOG_WARNING,
+			lzfs_pretty_syslog(LOG_WARNING,
 			       "directory inode %" PRIu32 ": unknown goal !!! - fixing", node->id);
 			node->goal = DEFAULT_GOAL;
 		}
@@ -1568,8 +1570,9 @@ void fsnodes_seteattr_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint8_t
 		}
 		if (neweattr != (node->mode >> 12)) {
 			node->mode = (node->mode & 0xFFF) | (((uint16_t)neweattr) << 12);
-			if (node->acl) {
-				node->acl->setMode(node->mode, node->type == FSNode::kDirectory);
+			const RichACL *node_acl = gMetadata->acl_storage.get(node->id);
+			if (node_acl) {
+				gMetadata->acl_storage.setMode(node->id, node->mode, node->type == FSNode::kDirectory);
 			}
 			(*sinodes)++;
 			fsnodes_update_ctime(node, ts);
@@ -1589,25 +1592,32 @@ void fsnodes_seteattr_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint8_t
 
 uint8_t fsnodes_deleteacl(FSNode *p, AclType type, uint32_t ts) {
 	if (type == AclType::kRichACL) {
-		p->acl.reset();
+		gMetadata->acl_storage.erase(p->id);
 	} else if (type == AclType::kDefault) {
 		if (p->type != FSNode::kDirectory) {
 			return LIZARDFS_ERROR_ENOTSUP;
 		}
-
-		if (p->acl) {
-			p->acl->createExplicitInheritance();
-			p->acl->removeInheritOnly(true);
-			if (p->acl->size() == 0) {
-				p->acl.reset();
+		const RichACL *node_acl = gMetadata->acl_storage.get(p->id);
+		if (node_acl) {
+			RichACL new_acl = *node_acl;
+			new_acl.createExplicitInheritance();
+			new_acl.removeInheritOnly(true);
+			if (new_acl.size() == 0) {
+				gMetadata->acl_storage.erase(p->id);
+			} else {
+				gMetadata->acl_storage.set(p->id, std::move(new_acl));
 			}
 		}
 	} else if (type == AclType::kAccess) {
-		if (p->acl) {
-			p->acl->createExplicitInheritance();
-			p->acl->removeInheritOnly(false);
-			if (p->acl->size() == 0) {
-				p->acl.reset();
+		const RichACL *node_acl = gMetadata->acl_storage.get(p->id);
+		if (node_acl) {
+			RichACL new_acl = *node_acl;
+			new_acl.createExplicitInheritance();
+			new_acl.removeInheritOnly(false);
+			if (new_acl.size() == 0) {
+				gMetadata->acl_storage.erase(p->id);
+			} else {
+				gMetadata->acl_storage.set(p->id, std::move(new_acl));
 			}
 		}
 	} else {
@@ -1620,11 +1630,12 @@ uint8_t fsnodes_deleteacl(FSNode *p, AclType type, uint32_t ts) {
 
 #ifndef METARESTORE
 uint8_t fsnodes_getacl(FSNode *p, RichACL &acl) {
-	if (!p->acl) {
+	const RichACL *richacl = gMetadata->acl_storage.get(p->id);
+	if (!richacl) {
 		return LIZARDFS_ERROR_ENOATTR;
 	}
-	acl = *p->acl;
-	assert((p->mode & 0777) == p->acl->getMode());
+	acl = *richacl;
+	assert((p->mode & 0777) == richacl->getMode());
 	return LIZARDFS_STATUS_OK;
 }
 #endif
@@ -1637,16 +1648,17 @@ uint8_t fsnodes_setacl(FSNode *p, const RichACL &acl, uint32_t ts) {
 	uint16_t mode = p->mode;
 	if (RichACL::equivMode(acl, mode, p->type == FSNode::kDirectory)) {
 		p->mode = (p->mode & ~0777) | (mode & 0777);
-		p->acl.reset();
+		gMetadata->acl_storage.erase(p->id);
 	} else {
 		if (!acl.isAutoSetMode()) {
 			p->mode = (p->mode & ~0777) | (acl.getMode() & 0777);
 		}
-		p->acl.reset(new RichACL(acl));
+		RichACL new_acl = acl;
 		if (acl.isAutoSetMode()) {
-			p->acl->setFlags(p->acl->getFlags() & ~RichACL::AUTO_SET_MODE);
-			p->acl->setMode(p->mode, p->type == FSNode::kDirectory);
+			new_acl.setFlags(new_acl.getFlags() & ~RichACL::kAutoSetMode);
+			new_acl.setMode(p->mode, p->type == FSNode::kDirectory);
 		}
+		gMetadata->acl_storage.set(p->id, std::move(new_acl));
 	}
 
 	fsnodes_update_ctime(p, ts);
@@ -1663,20 +1675,23 @@ uint8_t fsnodes_setacl(FSNode *p, AclType type, const AccessControlList &acl, ui
 		return LIZARDFS_ERROR_ENOTSUP;
 	}
 
-	if (p->acl) {
-		p->acl->createExplicitInheritance();
-		p->acl->removeInheritOnly(type == AclType::kDefault);
-	} else {
-		p->acl.reset(new RichACL());
+	const RichACL *node_acl = gMetadata->acl_storage.get(p->id);
+	RichACL new_acl;
+
+	if (node_acl) {
+		new_acl = *node_acl;
+		new_acl.createExplicitInheritance();
+		new_acl.removeInheritOnly(type == AclType::kDefault);
 	}
 
 	if (type == AclType::kDefault) {
-		p->acl->appendDefaultPosixACL(acl);
-		p->acl->setMode(p->mode, true);
+		new_acl.appendDefaultPosixACL(acl);
+		new_acl.setMode(p->mode, true);
 	} else {
-		p->acl->appendPosixACL(acl, p->type == FSNode::kDirectory);
-		p->mode = (p->mode & ~0777) | (p->acl->getMode() & 0777);
+		new_acl.appendPosixACL(acl, p->type == FSNode::kDirectory);
+		p->mode = (p->mode & ~0777) | (new_acl.getMode() & 0777);
 	}
+	gMetadata->acl_storage.set(p->id, std::move(new_acl));
 
 	fsnodes_update_ctime(p, ts);
 	fsnodes_update_checksum(p);
@@ -1709,11 +1724,15 @@ int fsnodes_access(const FsContext &context, FSNode *node, uint8_t modemask) {
 	if ((context.sesflags() & SESFLAG_NOMASTERPERMCHECK) || context.uid() == 0) {
 		return 1;
 	}
-	if (node->acl) {
-		assert((node->mode & 0777) == node->acl->getMode());
+	const RichACL *node_acl = gMetadata->acl_storage.get(node->id);
+	if (node_acl) {
+		assert((node->mode & 0777) == node_acl->getMode());
 
 		uint32_t mask = RichACL::convertMode2Mask(modemask);
-		return node->acl->checkPermission(mask, node->uid, node->gid, context.uid(), context.groups());
+		if (node->type != FSNode::kDirectory) {
+			mask &= ~RichACL::Ace::kDeleteChild;
+		}
+		return node_acl->checkPermission(mask, node->uid, node->gid, context.uid(), context.groups());
 	} else {
 		if (context.uid() == node->uid || (node->mode & (EATTR_NOOWNER << 12))) {
 			nodemode = ((node->mode) >> 6) & 7;

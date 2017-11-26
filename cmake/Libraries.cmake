@@ -7,6 +7,11 @@ if(ENABLE_TESTS)
                     "ef5e700c8a0f3ee123e2e0209b8b4961")
 endif()
 
+download_external(SPDLOG "spdlog-0.14.0"
+                  "https://github.com/gabime/spdlog/archive/v0.14.0.zip"
+                  "f213d83c466aa7044a132e2488d71b11"
+                  "spdlog-1")
+
 # Find standard libraries
 find_package(Socket REQUIRED)
 find_package(Threads REQUIRED)
@@ -127,8 +132,12 @@ find_package(DB 11.2.5.2)
 
 # Find Intel Storage Acceleration library
 find_library(ISAL_LIBRARY isal)
-find_library(ISAL_PIC_LIBRARY isal.so)
-if (NOT ISAL_PIC_LIBRARY)
+if(APPLE)
+  find_library(ISAL_PIC_LIBRARY libisal.dylib)
+else()
+  find_library(ISAL_PIC_LIBRARY libisal.so)
+endif()
+if(NOT ISAL_PIC_LIBRARY)
   find_library(ISAL_PIC_LIBRARY isal_pic)
 endif()
 if (NOT ISAL_PIC_LIBRARY)
@@ -136,3 +145,12 @@ if (NOT ISAL_PIC_LIBRARY)
 endif()
 message(STATUS "ISAL(Intel Storage Acceleration) LIBRARY: ${ISAL_LIBRARY}")
 message(STATUS "ISAL PIC LIBRARY: ${ISAL_PIC_LIBRARY}")
+
+# Download nfs-ganesha
+if(ENABLE_NFS_GANESHA)
+  download_external(NFS_GANESHA "nfs-ganesha-2.5-stable"
+                    "https://github.com/nfs-ganesha/nfs-ganesha/archive/V2.5-stable.zip")
+  download_external(NTIRPC "ntirpc-1.5"
+                    "https://github.com/nfs-ganesha/ntirpc/archive/v1.5.zip")
+endif()
+

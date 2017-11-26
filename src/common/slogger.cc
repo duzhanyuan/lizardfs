@@ -25,104 +25,116 @@
 #include <unistd.h>
 #include <string>
 
+#include "common/cfg.h"
 #include "common/mfserr.h"
-#include "common/debug_log.h"
 
-static bool gPrintf = true;
-
-bool lzfs_is_printf_enabled() {
-	return gPrintf;
+static lzfs::log_level::LogLevel log_level_from_syslog(int priority) {
+	static const std::array<lzfs::log_level::LogLevel, 8> kSyslogToLevel = {{
+		lzfs::log_level::critical, // emerg
+		lzfs::log_level::critical, // alert
+		lzfs::log_level::critical, // critical
+		lzfs::log_level::err,      // error
+		lzfs::log_level::warn,     // warning
+		lzfs::log_level::info,     // notice
+		lzfs::log_level::info,     // info
+		lzfs::log_level::debug,    // debug
+	}};
+	return kSyslogToLevel[std::min<int>(priority, kSyslogToLevel.size())];
 }
 
-void lzfs_disable_printf() {
-	gPrintf = false;
+bool lzfs_add_log_file(const char *path, int priority, int max_file_size, int max_file_count) {
+	return lzfs::add_log_file(path, log_level_from_syslog(priority), max_file_size, max_file_count);
 }
 
-void lzfs_enable_printf() {
-	gPrintf = true;
+void lzfs_set_log_flush_on(int priority) {
+	return lzfs::set_log_flush_on(log_level_from_syslog(priority));
 }
 
-void lzfs_pretty_prefix(const char* msg) {
-	if (lzfs_is_printf_enabled()) {
-		fprintf(stderr, "[%s] ", msg);
+void lzfs_drop_all_logs() {
+	return lzfs::drop_all_logs();
+}
+
+bool lzfs_add_log_stderr(int priority) {
+	return lzfs::add_log_stderr(log_level_from_syslog(priority));
+}
+
+bool lzfs_add_log_syslog() {
+	return lzfs::add_log_syslog();
+}
+
+bool lzfs::add_log_file(const char *path, log_level::LogLevel level, int max_file_size, int max_file_count) {
+	try {
+		LoggerPtr logger = spdlog::rotating_logger_mt(path, path, max_file_size, max_file_count);
+		logger->set_level((spdlog::level::level_enum)level);
+		// Format: DATE TIME [LEVEL] [PID:TID] : MESSAGE
+		logger->set_pattern("%D %H:%M:%S.%e [%l] [%P:%t] : %v");
+		return true;
+	} catch (const spdlog::spdlog_ex &e) {
+		lzfs_pretty_syslog(LOG_ERR, "Adding %s log file failed: %s", path, e.what());
 	}
+	return false;
 }
 
-void lzfs_pretty_prefix(int priority) {
-	switch (priority) {
-		case LOG_ERR:
-			lzfs_pretty_prefix("FAIL");
-			break;
-		case LOG_WARNING:
-			lzfs_pretty_prefix("WARN");
-			break;
-		case LOG_INFO:
-		case LOG_NOTICE:
-			lzfs_pretty_prefix(" OK ");
-			break;
-		default:
-			lzfs_pretty_prefix("    ");
-			break;
-	}
+void lzfs::set_log_flush_on(log_level::LogLevel level) {
+	spdlog::apply_all([level](LoggerPtr l) {l->flush_on((spdlog::level::level_enum)level);});
 }
 
-void lzfs_pretty_prefix_attempt() {
-	lzfs_pretty_prefix("....");
+void lzfs::drop_all_logs() {
+	spdlog::drop_all();
 }
 
-// Converts first syslog's priority into a human readable string
-static std::string syslogLevelToString(int priority) {
-	switch (priority) {
-	case LOG_EMERG: return "emerg";
-	case LOG_ALERT: return "alert";
-	case LOG_CRIT: return "crit";
-	case LOG_ERR: return "err";
-	case LOG_WARNING: return "warning";
-	case LOG_NOTICE: return "notice";
-	case LOG_INFO: return "info";
-	case LOG_DEBUG: return "debug";
-	default: return "???";
-	}
-}
-
-static void lzfs_vsyslog(bool silent, int priority, const char* format, va_list ap) {
-	if (!silent && lzfs_is_printf_enabled()) {
-		va_list ap2;
-		va_copy(ap2, ap);
-		vfprintf(stderr, format, ap2);
-		va_end(ap2);
-		fputc('\n', stderr);
-	}
+bool lzfs::add_log_syslog() {
 #ifndef _WIN32
-	{
-		va_list ap2;
-		va_copy(ap2, ap);
-		vsyslog(priority, format, ap2);
-		va_end(ap2);
+	try {
+		spdlog::syslog_logger("syslog");
+		return true;
+	} catch (const spdlog::spdlog_ex &e) {
+		lzfs_pretty_syslog(LOG_ERR, "Adding syslog log failed: %s", e.what());
 	}
 #endif
-	{
-		std::string tag = "syslog." + syslogLevelToString(priority);
-		va_list ap2;
-		va_copy(ap2, ap);
-		DEBUG_LOGFV(tag, format, ap2);
-		va_end(ap2);
+	return false;
+}
+
+bool lzfs::add_log_stderr(log_level::LogLevel level) {
+	try {
+		LoggerPtr logger = spdlog::stderr_color_mt("stderr");
+		logger->set_level((spdlog::level::level_enum)level);
+		// Format: DATE TIME [LEVEL] [PID:TID] : MESSAGE
+		logger->set_pattern("%D %H:%M:%S.%e [%l] [%P:%t] : %v");
+		return true;
+	} catch (const spdlog::spdlog_ex &e) {
+		lzfs_pretty_syslog(LOG_ERR, "Adding stderr log failed: %s", e.what());
 	}
+	return false;
+}
+
+static void lzfs_vsyslog(int priority, const char* format, va_list ap) {
+	char buf[1024];
+	va_list ap2;
+	va_copy(ap2, ap);
+	int written = vsnprintf(buf, 1023, format, ap2);
+	if (written < 0) {
+		return;
+	}
+	buf[std::min<int>(written, sizeof(buf))] = '\0';
+	va_end(ap2);
+
+	spdlog::apply_all([priority, buf](LoggerPtr l) {
+		l->log((spdlog::level::level_enum)log_level_from_syslog(priority), buf);
+	});
 }
 
 void lzfs_pretty_syslog(int priority, const char* format, ...) {
-	lzfs_pretty_prefix(priority);
 	va_list ap;
 	va_start(ap, format);
-	lzfs_vsyslog(false, priority, format, ap);
+	lzfs_vsyslog(priority, format, ap);
 	va_end(ap);
 }
 
 void lzfs_pretty_syslog_attempt(int priority, const char* format, ...) {
-	lzfs_pretty_prefix_attempt();
 	va_list ap;
 	va_start(ap, format);
-	lzfs_vsyslog(false, priority, format, ap);
+	lzfs_vsyslog(priority, format, ap);
 	va_end(ap);
 }
 
@@ -141,7 +153,7 @@ void lzfs_pretty_errlog(int priority, const char* format, ...) {
 void lzfs_silent_syslog(int priority, const char* format, ...) {
 	va_list ap;
 	va_start(ap, format);
-	lzfs_vsyslog(true, priority, format, ap);
+	lzfs_vsyslog(priority, format, ap);
 	va_end(ap);
 }
 

@@ -80,7 +80,12 @@ enum class error {
 	filename_too_long,
 	file_too_large,
 	bad_file_descriptor,
-	no_message_available
+#if defined(__APPLE__) || defined(__FreeBSD__)
+	no_message,
+#else
+	no_message_available,
+#endif
+	argument_list_too_long,
 };
 
 namespace detail {

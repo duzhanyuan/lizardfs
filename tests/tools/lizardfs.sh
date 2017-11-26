@@ -119,7 +119,7 @@ setup_local_empty_lizardfs() {
 lizardfs_chunkserver_daemon() {
 	local id=$1
 	shift
-	mfschunkserver -c "${lizardfs_info_[chunkserver${id}_config]}" "$@" | cat
+	mfschunkserver -c "${lizardfs_info_[chunkserver${id}_cfg]}" "$@" | cat
 	return ${PIPESTATUS[0]}
 }
 
@@ -215,17 +215,7 @@ create_magic_debug_log_entry_() {
 	# By default, fail on all prefixes passed in DEBUG_LOG_FAIL_ON
 	local prefixes=${DEBUG_LOG_FAIL_ON:-}
 
-	# This is a list of other entries, which are added to each test (but can be disabled)
-	# Add all these entries to the 'prefixes' list if not disabled using DEBUG_LOG_DISABLE_FAIL_ON
-	local auto_prefixes=("fatal.assert" "fatal.abort" "master.mismatch")
-	local disable_regex=${DEBUG_LOG_DISABLE_FAIL_ON:-$^} # default value matches nothing
 	local prefix
-	for prefix in "${auto_prefixes[@]}"; do
-		if ! [[ $prefix =~ $disable_regex ]]; then
-			prefixes+=" $prefix"
-		fi
-	done
-
 	# Create MAGIC_DEBUG_LOG_C config entry from all requested prefixes
 	if [[ $prefixes ]]; then
 		echo -n "MAGIC_DEBUG_LOG_C = "
@@ -452,7 +442,7 @@ add_chunkserver_() {
 	mfschunkserver -c "$chunkserver_cfg" start
 
 	lizardfs_info_[chunkserver${chunkserver_id}_port]=$csserv_port
-	lizardfs_info_[chunkserver${chunkserver_id}_config]=$chunkserver_cfg
+	lizardfs_info_[chunkserver${chunkserver_id}_cfg]=$chunkserver_cfg
 	lizardfs_info_[chunkserver${chunkserver_id}_hdd]=$hdd_cfg
 }
 
@@ -492,7 +482,7 @@ add_mount_() {
 	create_mfsmount_cfg_ ${mount_id} > "$mount_cfg"
 	mkdir -p "$mount_dir"
 	lizardfs_info_[mount${mount_id}]="$mount_dir"
-	lizardfs_info_[mount${mount_id}_config]="$mount_cfg"
+	lizardfs_info_[mount${mount_id}_cfg]="$mount_cfg"
 	max_tries=30
 	fuse_options=""
 	for fuse_option in $(echo ${FUSE_EXTRA_CONFIG-} | tr '|' '\n'); do

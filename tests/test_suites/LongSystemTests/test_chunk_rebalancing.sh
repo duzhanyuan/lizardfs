@@ -4,7 +4,7 @@ rebalancing_timeout=90
 CHUNKSERVERS=5 \
 	USE_LOOP_DISKS=YES \
 	MOUNT_EXTRA_CONFIG="mfscachemode=NEVER" \
-	CHUNKSERVER_EXTRA_CONFIG="HDD_TEST_FREQ = 0|HDD_LEAVE_SPACE_DEFAULT = 0MiB" \
+	CHUNKSERVER_EXTRA_CONFIG="HDD_TEST_FREQ = 10000|HDD_LEAVE_SPACE_DEFAULT = 0MiB" \
 	MASTER_EXTRA_CONFIG="CHUNKS_LOOP_TIME = 1`
 			`|CHUNKS_WRITE_REP_LIMIT = 1`
 			`|CHUNKS_READ_REP_LIMIT = 2`
@@ -42,10 +42,9 @@ done
 MESSAGE="Chunks are not rebalanced properly" assert_equals "$expected_rebalancing_status" "$status"
 
 for csid in {0..4}; do
-	config=${info[chunkserver${csid}_config]}
-	mfschunkserver -c "${config}" stop
+	lizardfs_chunkserver_daemon $csid stop
 	MESSAGE="Validating files without chunkserver $csid" expect_success file-validate dir/*
 	MESSAGE="Validating files without chunkserver $csid" expect_success file-validate dirxor/*
-	mfschunkserver -c "${config}" start
+	lizardfs_chunkserver_daemon $csid start
 	lizardfs_wait_for_all_ready_chunkservers
 done

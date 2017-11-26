@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <fstream>
 #include <list>
 #include <memory>
 
@@ -116,13 +117,13 @@ static void signal_pipe_serv(const std::vector<pollfd> &pdesc) {
 		uint8_t sigid;
 		if (read(signalpipe[0],&sigid,1)==1) {
 			if (sigid == '\001' && gExitingStatus == ExitingStatus::kRunning) {
-				syslog(LOG_NOTICE,"terminate signal received");
+				lzfs_pretty_syslog(LOG_NOTICE,"terminate signal received");
 				gExitingStatus = ExitingStatus::kWantExit;
 			} else if (sigid=='\002') {
-				syslog(LOG_NOTICE,"reloading config files");
+				lzfs_pretty_syslog(LOG_NOTICE,"reloading config files");
 				gReloadRequested = true;
 			} else if (sigid=='\003') {
-				syslog(LOG_NOTICE, "Received SIGUSR1, killing gently...");
+				lzfs_pretty_syslog(LOG_NOTICE, "Received SIGUSR1, killing gently...");
 				exit(LIZARDFS_EXIT_STATUS_GENTLY_KILL);
 			}
 		}
@@ -171,42 +172,51 @@ const std::string& set_syslog_ident() {
 	closelog();
 	if (gRunAsDaemon) {
 		openlog(logIdent.c_str(), LOG_PID | LOG_NDELAY, LOG_DAEMON);
-		lzfs_disable_printf();
 	} else {
 #if defined(LOG_PERROR)
 		openlog(logIdent.c_str(), LOG_PID | LOG_NDELAY | LOG_PERROR, LOG_USER);
-		lzfs_disable_printf();
 #else
 		openlog(logIdent.c_str(), LOG_PID | LOG_NDELAY, LOG_USER);
 #endif
 	}
+
 	return logIdent;
 }
 
 static void main_configure_debug_log() {
-	std::string debugLogConfiguration;
+	std::string flush_on_str = cfg_getstring("LOG_FLUSH_ON", "CRITICAL");
+	int priority = LOG_CRIT;
+	if (flush_on_str == "ERROR") {
+		priority = LOG_ERR;
+	} else if (flush_on_str == "WARNING") {
+		priority = LOG_WARNING;
+	} else if (flush_on_str == "INFO") {
+		priority = LOG_INFO;
+	} else if (flush_on_str == "DEBUG") {
+		priority = LOG_DEBUG;
+	}
+	lzfs::drop_all_logs();
+	lzfs::add_log_syslog();
 	for (std::string suffix : {"", "_A", "_B", "_C"}) {
 		std::string configEntryName = "MAGIC_DEBUG_LOG" + suffix;
 		std::string value = cfg_get(configEntryName.c_str(), "");
 		if (value.empty()) {
 			continue;
 		}
-		if (!debugLogConfiguration.empty()) {
-			debugLogConfiguration += ',';
-		}
-		debugLogConfiguration += value;
+		lzfs_add_log_file(value.c_str(), LOG_DEBUG, 16*1024*1024, 8);
 	}
-	DebugLog::setConfiguration(std::move(debugLogConfiguration));
+	lzfs_set_log_flush_on(priority);
 }
 
 void main_reload() {
 	// Reload SYSLOG_IDENT
-	syslog(LOG_NOTICE, "Changing SYSLOG_IDENT to %s",
+	lzfs_pretty_syslog(LOG_NOTICE, "Changing SYSLOG_IDENT to %s",
 			cfg_get("SYSLOG_IDENT", STR(APPNAME)).c_str());
 	set_syslog_ident();
 
 	// Reload MAGIC_DEBUG_LOG
 	main_configure_debug_log();
+	lzfs_silent_syslog(LOG_DEBUG, "main.reload");
 }
 
 /* signals */
@@ -374,17 +384,20 @@ void changeugid(RunMode runmode) {
 		free(wuser);
 		free(wgroup);
 
-		if (setgid(wrk_gid)<0) {
-			lzfs_pretty_errlog(LOG_ERR,"can't set gid to %d",(int)wrk_gid);
+		if (setgroups(0, NULL) < 0) {
+			lzfs::log_warn("can't reset supplementary groups");
+		}
+		if (setgid(wrk_gid) < 0) {
+			lzfs::log_err("can't set gid to {}", (int)wrk_gid);
 			exit(LIZARDFS_EXIT_STATUS_ERROR);
 		} else if ((runmode == RunMode::kStart) || (runmode == RunMode::kRestart)){
-			syslog(LOG_NOTICE,"set gid to %d",(int)wrk_gid);
+			lzfs::log_info("set gid to {}", (int)wrk_gid);
 		}
 		if (setuid(wrk_uid)<0) {
-			lzfs_pretty_errlog(LOG_ERR,"can't set uid to %d",(int)wrk_uid);
+			lzfs::log_err("can't set uid to {}", (int)wrk_uid);
 			exit(LIZARDFS_EXIT_STATUS_ERROR);
 		} else if ((runmode == RunMode::kStart) || (runmode == RunMode::kRestart)){
-			syslog(LOG_NOTICE,"set uid to %d",(int)wrk_uid);
+			lzfs::log_info("set uid to {}", (int)wrk_uid);
 		}
 	}
 }
@@ -862,6 +875,11 @@ int main(int argc,char **argv) {
 		return LIZARDFS_EXIT_STATUS_ERROR;
 	}
 
+	if (gRunAsDaemon) {
+		lzfs::add_log_stderr(lzfs::log_level::warn);
+	} else {
+		lzfs::add_log_stderr(lzfs::log_level::debug);
+	}
 	if (runmode==RunMode::kStart || runmode==RunMode::kRestart) {
 		if (gRunAsDaemon) {
 			makedaemon();

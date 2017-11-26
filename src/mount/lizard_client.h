@@ -95,7 +95,6 @@ struct FsInitParams {
 #else
 	static constexpr SugidClearMode kDefaultSugidClearMode = SugidClearMode::kNever;
 #endif
-	static constexpr bool     kDefaultAclEnabled = false;
 	static constexpr bool     kDefaultUseRwLock = true;
 	static constexpr double   kDefaultAclCacheTimeout = 1.0;
 	static constexpr unsigned kDefaultAclCacheSize = 1000;
@@ -124,7 +123,7 @@ struct FsInitParams {
 	             direntry_cache_timeout(kDefaultDirentryCacheTimeout), direntry_cache_size(kDefaultDirentryCacheSize),
 	             entry_cache_timeout(kDefaultEntryCacheTimeout), attr_cache_timeout(kDefaultAttrCacheTimeout),
 	             mkdir_copy_sgid(kDefaultMkdirCopySgid), sugid_clear_mode(kDefaultSugidClearMode),
-	             acl_enabled(kDefaultAclEnabled), use_rw_lock(kDefaultUseRwLock),
+	             use_rw_lock(kDefaultUseRwLock),
 	             acl_cache_timeout(kDefaultAclCacheTimeout), acl_cache_size(kDefaultAclCacheSize),
 	             verbose(kDefaultVerbose) {
 	}
@@ -151,7 +150,7 @@ struct FsInitParams {
 	             direntry_cache_timeout(kDefaultDirentryCacheTimeout), direntry_cache_size(kDefaultDirentryCacheSize),
 	             entry_cache_timeout(kDefaultEntryCacheTimeout), attr_cache_timeout(kDefaultAttrCacheTimeout),
 	             mkdir_copy_sgid(kDefaultMkdirCopySgid), sugid_clear_mode(kDefaultSugidClearMode),
-	             acl_enabled(kDefaultAclEnabled), use_rw_lock(kDefaultUseRwLock),
+	             use_rw_lock(kDefaultUseRwLock),
 	             acl_cache_timeout(kDefaultAclCacheTimeout), acl_cache_size(kDefaultAclCacheSize),
 	             verbose(kDefaultVerbose) {
 	}
@@ -193,7 +192,6 @@ struct FsInitParams {
 	double attr_cache_timeout;
 	bool mkdir_copy_sgid;
 	SugidClearMode sugid_clear_mode;
-	bool acl_enabled;
 	bool use_rw_lock;
 	double acl_cache_timeout;
 	unsigned acl_cache_size;
@@ -375,10 +373,6 @@ void access(const Context &ctx, Inode ino, int mask);
 EntryParam create(const Context &ctx, Inode parent, const char *name,
 		mode_t mode, FileInfo* fi);
 
-void getlk(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
-void setlk(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock, int sleep);
-void flock_interrupt(uint32_t reqid);
-void setlk_interrupt(uint32_t reqid);
 void getlk(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
 uint32_t setlk_send(const Context &ctx, Inode ino, FileInfo* fi, struct lzfs_locks::FlockWrapper &lock);
 void setlk_recv();

@@ -43,7 +43,7 @@
 
 std::array<uint32_t, FsStats::Size> gFsStatsArray = {{}};
 
-static const char kAclXattrs[] = "system.posix_acl_access\0system.posix_acl_default\0system.richacl\0system.nfs4_acl";
+static const char kAclXattrs[] = "system.richacl";
 
 void fs_retrieve_stats(std::array<uint32_t, FsStats::Size> &output_stats) {
 	output_stats = gFsStatsArray;
@@ -474,7 +474,7 @@ uint8_t fs_whole_path_lookup(const FsContext &context, uint32_t parent, const st
 
 	*found_inode = tmp_inode;
 	if (tmp_inode == context.rootinode()) {
-		return fs_getattr(context, tmp_inode, attr);
+		return fs_getattr(context, SPECIAL_INODE_ROOT, attr);
 	}
 	return LIZARDFS_STATUS_OK;
 }
@@ -751,9 +751,7 @@ uint8_t fs_setattr(const FsContext &context, uint32_t inode, uint8_t setmask, ui
 	}
 	if (setmask & SET_MODE_FLAG) {
 		p->mode = (attrmode & 07777) | (p->mode & 0xF000);
-		if (p->acl) {
-			p->acl->setMode(p->mode, p->type == FSNode::kDirectory);
-		}
+		gMetadata->acl_storage.setMode(p->id, p->mode, p->type == FSNode::kDirectory);
 	}
 	if (setmask & (SET_UID_FLAG | SET_GID_FLAG)) {
 		fsnodes_change_uid_gid(p, ((setmask & SET_UID_FLAG) ? attruid : p->uid),
@@ -789,9 +787,7 @@ uint8_t fs_apply_attr(uint32_t ts, uint32_t inode, uint32_t mode, uint32_t uid, 
 		return LIZARDFS_ERROR_EINVAL;
 	}
 	p->mode = mode | (p->mode & 0xF000);
-	if (p->acl) {
-		p->acl->setMode(p->mode, p->type == FSNode::kDirectory);
-	}
+	gMetadata->acl_storage.setMode(p->id, p->mode, p->type == FSNode::kDirectory);
 	if (p->uid != uid || p->gid != gid) {
 		fsnodes_change_uid_gid(p, uid, gid);
 	}
@@ -1826,7 +1822,7 @@ uint8_t fs_release(const FsContext &context, uint32_t inode, uint32_t sessionid)
 		return LIZARDFS_STATUS_OK;
 	}
 #ifndef METARESTORE
-	syslog(LOG_WARNING, "release: session not found");
+	lzfs_pretty_syslog(LOG_WARNING, "release: session not found");
 #endif
 	return LIZARDFS_ERROR_EINVAL;
 }
@@ -1856,12 +1852,12 @@ uint8_t fs_auto_repair_if_needed(FSNodeFile *p, uint32_t chunkIndex) {
 		uint32_t notchanged, erased, repaired;
 		FsContext context = FsContext::getForMasterWithSession(0, SPECIAL_INODE_ROOT, 0, 0, 0, 0, 0);
 		fs_repair(context, p->id, 0, &notchanged, &erased, &repaired);
-		syslog(LOG_NOTICE,
+		lzfs_pretty_syslog(LOG_NOTICE,
 		       "auto repair inode %" PRIu32 ", chunk %016" PRIX64
 		       ": "
 		       "not changed: %" PRIu32 ", erased: %" PRIu32 ", repaired: %" PRIu32,
 		       p->id, chunkId, notchanged, erased, repaired);
-		DEBUG_LOG("master.fs.file_auto_repaired") << p->id << " " << repaired;
+		lzfs_silent_syslog(LOG_DEBUG, "master.fs.file_auto_repaired: %u %u", p->id, repaired);
 	}
 	return LIZARDFS_STATUS_OK;
 }

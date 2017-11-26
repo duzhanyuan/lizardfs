@@ -73,7 +73,6 @@
 #include "common/crc.h"
 #include "common/cwrap.h"
 #include "common/datapack.h"
-#include "common/debug_log.h"
 #include "common/disk_info.h"
 #include "common/exceptions.h"
 #include "common/event_loop.h"
@@ -105,7 +104,7 @@
 
 #define CHUNKLOCKED ((void*)1)
 
-static std::atomic<uint32_t> HDDTestFreq(10);
+static std::atomic<unsigned> HDDTestFreq_ms(10 * 1000);
 
 /// Number of bytes which should be addded to each disk's used space
 static uint64_t gLeaveFree;
@@ -932,7 +931,7 @@ void hdd_check_folders() {
 			}
 			if (f->toremove==0) { // 0 here means 'removed', so delete it from data structures
 				*fptr = f->next;
-				syslog(LOG_NOTICE,"folder %s successfully removed",f->path);
+				lzfs_pretty_syslog(LOG_NOTICE,"folder %s successfully removed",f->path);
 				if (f->lfd>=0) {
 					close(f->lfd);
 				}
@@ -979,7 +978,7 @@ void hdd_check_folders() {
 				}
 			}
 			if (err>=ERRORLIMIT && f->todel<2) {
-				syslog(LOG_WARNING,"%u errors occurred in %u seconds on folder: %s",err,LASTERRTIME,f->path);
+				lzfs_pretty_syslog(LOG_WARNING,"%u errors occurred in %u seconds on folder: %s",err,LASTERRTIME,f->path);
 				hdd_senddata(f,1);
 				f->damaged = 1;
 				changed = 1;
@@ -1136,7 +1135,7 @@ static inline int hdd_int_chunk_readcrc(MooseFSChunk *c, uint32_t chunk_version)
 		return LIZARDFS_ERROR_IO;
 	}
 	if (!chunkSignature.hasValidSignatureId()) {
-		syslog(LOG_WARNING,
+		lzfs_pretty_syslog(LOG_WARNING,
 				"chunk_readcrc: file:%s - wrong header", c->filename().c_str());
 		errno = 0;
 		return LIZARDFS_ERROR_IO;
@@ -1147,7 +1146,7 @@ static inline int hdd_int_chunk_readcrc(MooseFSChunk *c, uint32_t chunk_version)
 	if (c->chunkid != chunkSignature.chunkId()
 			|| chunk_version != chunkSignature.chunkVersion()
 			|| c->type().getId() != chunkSignature.chunkType().getId()) {
-		syslog(LOG_WARNING,
+		lzfs_pretty_syslog(LOG_WARNING,
 				"chunk_readcrc: file:%s - wrong id/version/type in header "
 				"(%016" PRIX64 "_%08" PRIX32 ", typeId %" PRIu8 ")",
 				c->filename().c_str(),
@@ -1535,9 +1534,9 @@ int hdd_prefetch_blocks(uint64_t chunkid, ChunkPartType chunk_type, uint32_t fir
 
 	hdd_prefetch(*c, first_block, block_count);
 
-	DEBUG_LOG("chunkserver.hdd_prefetch_blocks")
-			<< "chunk:" << chunkid << " status:" << (uint16_t)status
-			<< " firstBlock:" << first_block << " nrOfBlocks:" << block_count;
+	lzfs_silent_syslog(LOG_DEBUG, "chunkserver.hdd_prefetch_blocks chunk: %lu "
+	                   "status: %u firstBlock: %u nrOfBlocks: %u",
+	                   chunkid, status, first_block, block_count);
 
 	status = hdd_close(c);
 	if (status != LIZARDFS_STATUS_OK) {
@@ -1842,7 +1841,7 @@ int hdd_write(Chunk* chunk, uint32_t version,
 			if (get32bit(tmpPtr) != combinedcrc) {
 				errno = 0;
 				hdd_error_occured(chunk);  // uses and preserves errno !!!
-				syslog(LOG_WARNING, "write_block_to_chunk: file:%s - crc error",
+				lzfs_pretty_syslog(LOG_WARNING, "write_block_to_chunk: file:%s - crc error",
 				       chunk->filename().c_str());
 				hdd_report_damaged_chunk(chunk->chunkid, chunk->type());
 				return LIZARDFS_ERROR_CRC;
@@ -2054,7 +2053,7 @@ static int hdd_int_test(uint64_t chunkid, uint32_t version, ChunkPartType chunkT
 		if (get32bit(&crcBuffPointer) != mycrc32(0, data_in_buffer, MFSBLOCKSIZE)) {
 			errno = 0;      // set anything to errno
 			hdd_error_occured(c);   // uses and preserves errno !!!
-			syslog(LOG_WARNING, "test_chunk: file:%s - crc error", c->filename().c_str());
+			lzfs_pretty_syslog(LOG_WARNING, "test_chunk: file:%s - crc error", c->filename().c_str());
 			status = LIZARDFS_ERROR_CRC;
 			break;
 		}
@@ -2825,11 +2824,11 @@ static void hdd_test_chunk_thread() {
 			ChunkWithVersionAndType chunk = test_chunk_queue.get();
 			std::string name = chunk.toString();
 			if (hdd_int_test(chunk.id, chunk.version, chunk.type) !=LIZARDFS_STATUS_OK) {
-				syslog(LOG_NOTICE, "Chunk %s corrupted (detected by a client)",
+				lzfs_pretty_syslog(LOG_NOTICE, "Chunk %s corrupted (detected by a client)",
 						name.c_str());
 				hdd_report_damaged_chunk(chunk.id, chunk.type);
 			} else {
-				syslog(LOG_NOTICE, "Chunk %s spuriously reported as corrupted",
+				lzfs_pretty_syslog(LOG_NOTICE, "Chunk %s spuriously reported as corrupted",
 						name.c_str());
 			}
 		} catch (UniqueQueueEmptyException&) {
@@ -2847,22 +2846,18 @@ void hdd_test_chunk(ChunkWithVersionAndType chunk) {
 
 void hdd_tester_thread() {
 	TRACETHIS();
-	folder *f,*of;
+	folder *f, *of;
 	Chunk *c;
 	uint64_t chunkid;
 	uint32_t version;
 	ChunkPartType chunkType = slice_traits::standard::ChunkPartType();
-	uint32_t freq;
 	uint32_t cnt;
-	uint64_t st,en;
-	std::string path;
+	uint64_t start_us, end_us;
 
 	f = folderhead;
-	freq = HDDTestFreq;
 	cnt = 0;
 	while (!term) {
-		st = get_usectime();
-		path.clear();
+		start_us = get_usectime();
 		chunkid = 0;
 		version = 0;
 		{
@@ -2872,45 +2867,44 @@ void hdd_tester_thread() {
 			uint8_t testerresetExpected = 1;
 			if (testerreset.compare_exchange_strong(testerresetExpected, 0)) {
 				f = folderhead;
-				freq = HDDTestFreq;
 				cnt = 0;
 			}
-			cnt++;
-			if (cnt<freq || freq==0 || folderactions==0 || folderhead==NULL) {
-				path.clear();
+			cnt += std::min(HDDTestFreq_ms.load(), 1000U);
+			if (cnt < HDDTestFreq_ms || folderactions == 0 || folderhead == nullptr) {
+				chunkid = 0;
 			} else {
 				cnt = 0;
 				of = f;
 				do {
 					f = f->next;
-					if (f==NULL) {
+					if (f == nullptr) {
 						f = folderhead;
 					}
-				} while ((f->damaged || f->todel || f->toremove || f->scanstate!=SCST_WORKING) && of!=f);
-				if (of==f && (f->damaged || f->todel || f->toremove || f->scanstate!=SCST_WORKING)) {   // all folders are unavailable
-					path.clear();
+				} while ((f->damaged || f->todel || f->toremove || f->scanstate != SCST_WORKING) && of != f);
+				if (of == f && (f->damaged || f->todel || f->toremove || f->scanstate != SCST_WORKING)) {
+					chunkid = 0;
 				} else {
 					c = f->testhead;
 					if (c && c->state==CH_AVAIL) {
 						chunkid = c->chunkid;
 						version = c->version;
 						chunkType = c->type();
-						path = c->filename();
 					}
 				}
 			}
 		}
-		if (!path.empty()) {
-			if (hdd_int_test(chunkid, version, chunkType) !=LIZARDFS_STATUS_OK) {
+		if (chunkid > 0) {
+			if (hdd_int_test(chunkid, version, chunkType) != LIZARDFS_STATUS_OK) {
 				hdd_report_damaged_chunk(chunkid, chunkType);
 			}
-			path.clear();
+			chunkid = 0;
 		}
-		en = get_usectime();
-		if (en>st) {
-			en-=st;
-			if (en<1000000) {
-				usleep(1000000-en);
+		end_us = get_usectime();
+		if (end_us > start_us) {
+			unsigned time_to_sleep_us = 1000 * std::min(HDDTestFreq_ms.load(), 1000U);
+			end_us -= start_us;
+			if (end_us < time_to_sleep_us) {
+				usleep(time_to_sleep_us - end_us);
 			}
 		}
 	}
@@ -3318,7 +3312,7 @@ void hdd_term(void) {
 		try {
 			test_chunk_thread.join();
 		} catch (std::system_error &e) {
-			syslog(LOG_NOTICE, "Failed to join test chunk thread: %s", e.what());
+			lzfs_pretty_syslog(LOG_NOTICE, "Failed to join test chunk thread: %s", e.what());
 		}
 	}
 	{
@@ -3362,7 +3356,7 @@ void hdd_term(void) {
 			if (c->state==CH_AVAIL) {
 				MooseFSChunk* mc = dynamic_cast<MooseFSChunk*>(c);
 				if (c->wasChanged && mc) {
-					syslog(LOG_WARNING,"hdd_term: CRC not flushed - writing now");
+					lzfs_pretty_syslog(LOG_WARNING,"hdd_term: CRC not flushed - writing now");
 					if (chunk_writecrc(mc)!=LIZARDFS_STATUS_OK) {
 						lzfs_silent_errlog(LOG_WARNING,
 								"hdd_term: file:%s - write error", c->filename().c_str());
@@ -3371,7 +3365,7 @@ void hdd_term(void) {
 				gOpenChunks.purge(c->fd);
 				delete c;
 			} else {
-				syslog(LOG_WARNING,"hdd_term: locked chunk !!!");
+				lzfs_pretty_syslog(LOG_WARNING,"hdd_term: locked chunk !!!");
 			}
 		}
 		gOpenChunks.freeUnused(eventloop_time(), hashlock);
@@ -3387,7 +3381,7 @@ void hdd_term(void) {
 	for (cc=cclist; cc; cc = ccn) {
 		ccn = cc->next;
 		if (cc->wcnt) {
-			syslog(LOG_WARNING,"hddspacemgr (atexit): used cond !!!");
+			lzfs_pretty_syslog(LOG_WARNING,"hddspacemgr (atexit): used cond !!!");
 		}
 		delete cc;
 	}
@@ -3689,14 +3683,14 @@ static void hdd_folders_reinit(void) {
 			if (f->toremove==0) {
 				anyDiskAvailable = true;
 				if (f->scanstate==SCST_SCANNEEDED) {
-					syslog(LOG_NOTICE,"hdd space manager: folder %s will be scanned",f->path);
+					lzfs_pretty_syslog(LOG_NOTICE,"hdd space manager: folder %s will be scanned",f->path);
 				} else if (f->scanstate==SCST_SENDNEEDED) {
-					syslog(LOG_NOTICE,"hdd space manager: folder %s will be resend",f->path);
+					lzfs_pretty_syslog(LOG_NOTICE,"hdd space manager: folder %s will be resend",f->path);
 				} else {
-					syslog(LOG_NOTICE,"hdd space manager: folder %s didn't change",f->path);
+					lzfs_pretty_syslog(LOG_NOTICE,"hdd space manager: folder %s didn't change",f->path);
 				}
 			} else {
-				syslog(LOG_NOTICE,"hdd space manager: folder %s will be removed",f->path);
+				lzfs_pretty_syslog(LOG_NOTICE,"hdd space manager: folder %s will be removed",f->path);
 			}
 		}
 		folderactions = 1; // continue folder actions
@@ -3727,12 +3721,12 @@ void hdd_int_set_chunk_format() {
 	if (newFormat == ChunkFormat::MOOSEFS) {
 		if (defaultChunkFormat != ChunkFormat::MOOSEFS) {
 			MooseFSChunkFormat = true;
-			syslog(LOG_INFO,"new chunks format set to 'MOOSEFS' format");
+			lzfs_pretty_syslog(LOG_INFO,"new chunks format set to 'MOOSEFS' format");
 		}
 	} else {
 		if (defaultChunkFormat != ChunkFormat::INTERLEAVED) {
 			MooseFSChunkFormat = false;
-			syslog(LOG_INFO,"new chunks format set to 'INTERLEAVED' format");
+			lzfs_pretty_syslog(LOG_INFO,"new chunks format set to 'INTERLEAVED' format");
 		}
 	}
 }
@@ -3743,21 +3737,21 @@ void hdd_reload(void) {
 
 	PerformFsync = cfg_getuint32("PERFORM_FSYNC", 1);
 
-	HDDTestFreq = cfg_getuint32("HDD_TEST_FREQ",10);
+	HDDTestFreq_ms = cfg_ranged_get("HDD_TEST_FREQ", 10., 0.001, 1000000.) * 1000;
 
 	gPunchHolesInFiles = cfg_getuint32("HDD_PUNCH_HOLES", 0);
 
 	hdd_int_set_chunk_format();
 	char *LeaveFreeStr = cfg_getstr("HDD_LEAVE_SPACE_DEFAULT", gLeaveSpaceDefaultDefaultStrValue);
 	if (hdd_size_parse(LeaveFreeStr,&gLeaveFree)<0) {
-		syslog(LOG_NOTICE,"hdd space manager: HDD_LEAVE_SPACE_DEFAULT parse error - left unchanged");
+		lzfs_pretty_syslog(LOG_NOTICE,"hdd space manager: HDD_LEAVE_SPACE_DEFAULT parse error - left unchanged");
 	}
 	free(LeaveFreeStr);
 	if (gLeaveFree<0x4000000) {
-		syslog(LOG_NOTICE,"hdd space manager: HDD_LEAVE_SPACE_DEFAULT < chunk size - leaving so small space on hdd is not recommended");
+		lzfs_pretty_syslog(LOG_NOTICE,"hdd space manager: HDD_LEAVE_SPACE_DEFAULT < chunk size - leaving so small space on hdd is not recommended");
 	}
 
-	syslog(LOG_NOTICE,"reloading hdd data ...");
+	lzfs_pretty_syslog(LOG_NOTICE,"reloading hdd data ...");
 	try {
 		hdd_folders_reinit();
 	} catch (const Exception& ex) {
@@ -3774,7 +3768,7 @@ int hdd_late_init(void) {
 	try {
 		test_chunk_thread = std::thread(hdd_test_chunk_thread);
 	} catch (std::system_error &e) {
-		syslog(LOG_ERR, "Failed to create test chunk thread: %s", e.what());
+		lzfs_pretty_syslog(LOG_ERR, "Failed to create test chunk thread: %s", e.what());
 		abort();
 	}
 	return 0;
@@ -3832,7 +3826,7 @@ int hdd_init(void) {
 				"(searching for available chunks)");
 
 	gAdviseNoCache = cfg_getuint32("HDD_ADVISE_NO_CACHE", 0);
-	HDDTestFreq = cfg_getuint32("HDD_TEST_FREQ",10);
+	HDDTestFreq_ms = cfg_ranged_get("HDD_TEST_FREQ", 10., 0.001, 1000000.) * 1000;
 
 	gPunchHolesInFiles = cfg_getuint32("HDD_PUNCH_HOLES", 0);
 

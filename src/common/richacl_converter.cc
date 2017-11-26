@@ -20,8 +20,10 @@
 #include "common/richacl_converter.h"
 #include "common/portable_endian.h"
 #include "common/datapack.h"
+#ifndef _WIN32
 #include <pwd.h>
 #include <grp.h>
+#endif
 
 #include <bitset>
 
@@ -50,6 +52,7 @@ static uint32_t padLength(size_t length, size_t pad) {
 }
 
 static uint32_t nameToUid(const std::string &name) {
+#ifndef _WIN32
 	struct passwd *pwd = getpwnam(name.c_str());
 	if (pwd) {
 		return pwd->pw_uid;
@@ -63,9 +66,19 @@ static uint32_t nameToUid(const std::string &name) {
 		}
 	}
 	return kInvalidId;
+#else
+	if (name.size() > 2 && name[0] == 'u' && name[1] == ':') {
+		try {
+			return std::stoull(name.substr(2));
+		} catch (...) {
+		}
+	}
+	return kInvalidId;
+#endif
 }
 
 static uint32_t nameToGid(const std::string &name) {
+#ifndef _WIN32
 	struct group *grp = getgrnam(name.c_str());
 	if (grp) {
 		return grp->gr_gid;
@@ -79,22 +92,32 @@ static uint32_t nameToGid(const std::string &name) {
 		}
 	}
 	return kInvalidId;
+#else
+	if (name.size() > 2 && name[0] == 'g' && name[1] == ':') {
+		try {
+			return std::stoull(name.substr(2));
+		} catch (...) {
+		}
+	}
+	return kInvalidId;
+#endif
 }
 
 static std::string idToName(const RichACL::Ace &ace) {
-	if (ace.flags & RichACL::Ace::SPECIAL_WHO) {
+	if (ace.flags & RichACL::Ace::kSpecialWho) {
 		switch (ace.id) {
-		case RichACL::Ace::OWNER_SPECIAL_ID:
+		case RichACL::Ace::kOwnerSpecialId:
 			return "OWNER@";
-		case RichACL::Ace::GROUP_SPECIAL_ID:
+		case RichACL::Ace::kGroupSpecialId:
 			return "GROUP@";
-		case RichACL::Ace::EVERYONE_SPECIAL_ID:
+		case RichACL::Ace::kEveryoneSpecialId:
 			return "EVERYONE@";
 		default:
 			throw ConversionException("Incorrect special id: " + std::to_string(ace.id));
 		}
 	}
-	if (ace.flags & RichACL::Ace::IDENTIFIER_GROUP) {
+#ifndef _WIN32
+	if (ace.flags & RichACL::Ace::kIdentifierGroup) {
 		struct group *grp = getgrgid(ace.id);
 		if (grp) {
 			return grp->gr_name;
@@ -109,6 +132,13 @@ static std::string idToName(const RichACL::Ace &ace) {
 			return "u:" + std::to_string(ace.id);
 		}
 	}
+#else
+	if (ace.flags & RichACL::Ace::kIdentifierGroup) {
+		return "g:" + std::to_string(ace.id);
+	} else {
+		return "u:" + std::to_string(ace.id);
+	}
+#endif
 }
 
 static RichACL::Ace extractAceFromNFS(const uint8_t *&buffer, uint32_t &bytes_left) {
@@ -136,15 +166,15 @@ static RichACL::Ace extractAceFromNFS(const uint8_t *&buffer, uint32_t &bytes_le
 	ace.flags = flag;
 	ace.mask = access_mask;
 	if (owner == "OWNER@") {
-		ace.flags |= RichACL::Ace::SPECIAL_WHO;
-		ace.id = RichACL::Ace::OWNER_SPECIAL_ID;
+		ace.flags |= RichACL::Ace::kSpecialWho;
+		ace.id = RichACL::Ace::kOwnerSpecialId;
 	} else if (owner == "GROUP@") {
-		ace.flags |= RichACL::Ace::SPECIAL_WHO;
-		ace.id = RichACL::Ace::GROUP_SPECIAL_ID;
+		ace.flags |= RichACL::Ace::kSpecialWho;
+		ace.id = RichACL::Ace::kGroupSpecialId;
 	} else if (owner == "EVERYONE@") {
-		ace.flags |= RichACL::Ace::SPECIAL_WHO;
-		ace.id = RichACL::Ace::EVERYONE_SPECIAL_ID;
-	} else if (ace.flags & RichACL::Ace::IDENTIFIER_GROUP) {
+		ace.flags |= RichACL::Ace::kSpecialWho;
+		ace.id = RichACL::Ace::kEveryoneSpecialId;
+	} else if (ace.flags & RichACL::Ace::kIdentifierGroup) {
 		ace.id = nameToGid(owner);
 	} else {
 		ace.id = nameToUid(owner);
@@ -186,7 +216,7 @@ static RichACL::Ace extractAceFromRichACL(const uint8_t *&buffer, uint32_t &byte
 	const uint16_t incompatible_special_who = 0x4000;
 	if (flag & incompatible_special_who) {
 		flag &= ~incompatible_special_who;
-		flag |= RichACL::Ace::SPECIAL_WHO;
+		flag |= RichACL::Ace::kSpecialWho;
 	}
 
 	ace.type = type;
@@ -239,8 +269,8 @@ std::vector<uint8_t> richAclConverter::objectToRichACLXattr(const RichACL& acl) 
 		ace_wrapper->e_mask = htole32(ace.mask);
 		uint16_t flags = ace.flags;
 		const uint16_t incompatible_special_who = 0x4000;
-		if (flags & RichACL::Ace::SPECIAL_WHO) {
-			flags &= ~RichACL::Ace::SPECIAL_WHO;
+		if (flags & RichACL::Ace::kSpecialWho) {
+			flags &= ~RichACL::Ace::kSpecialWho;
 			flags |= incompatible_special_who;
 		}
 		ace_wrapper->e_flags = htole16(flags);
@@ -268,8 +298,8 @@ std::vector<uint8_t> richAclConverter::objectToNFSXattr(const RichACL& acl, uint
 		put32bit(&current, ace.type);
 		uint16_t flags = ace.flags;
 		const uint16_t incompatible_special_who = 0x4000;
-		if (flags & RichACL::Ace::SPECIAL_WHO) {
-			flags &= ~RichACL::Ace::SPECIAL_WHO;
+		if (flags & RichACL::Ace::kSpecialWho) {
+			flags &= ~RichACL::Ace::kSpecialWho;
 			flags |= incompatible_special_who;
 		}
 		put32bit(&current, flags);

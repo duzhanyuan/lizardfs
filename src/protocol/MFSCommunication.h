@@ -27,8 +27,6 @@
 #  include "common/platform.h"
 #endif
 
-#include "common/lizardfs_error_codes.h"
-
 #define MSB_1 0
 #define MSB_2 1
 #define MSB_4 2
@@ -206,7 +204,7 @@
 	NULL, \
 	NULL
 
-#ifdef LIZARDFS_WIRESHARK_PLUGIN
+#if defined(LIZARDFS_WIRESHARK_PLUGIN) || !defined(__cplusplus)
 /// field values: sugidclearmode
 #define SUGIDCLEAR_NEVER 0
 #define SUGIDCLEAR_ALWAYS 1

@@ -144,33 +144,8 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 		md5_final(md5pass.data(),&ctx);
 		memset(gMountOptions.password,0,strlen(gMountOptions.password));
 	} else if (gMountOptions.md5pass) {
-		md5pass.resize(16);
-		uint8_t *p = (uint8_t*)(gMountOptions.md5pass);
-		for (i=0 ; i<16 ; i++) {
-			if (*p>='0' && *p<='9') {
-				md5pass[i]=(*p-'0')<<4;
-			} else if (*p>='a' && *p<='f') {
-				md5pass[i]=(*p-'a'+10)<<4;
-			} else if (*p>='A' && *p<='F') {
-				md5pass[i]=(*p-'A'+10)<<4;
-			} else {
-				fprintf(stderr,"bad md5 definition (md5 should be given as 32 hex digits)\n");
-				return 1;
-			}
-			p++;
-			if (*p>='0' && *p<='9') {
-				md5pass[i]+=(*p-'0');
-			} else if (*p>='a' && *p<='f') {
-				md5pass[i]+=(*p-'a'+10);
-			} else if (*p>='A' && *p<='F') {
-				md5pass[i]+=(*p-'A'+10);
-			} else {
-				fprintf(stderr,"bad md5 definition (md5 should be given as 32 hex digits)\n");
-				return 1;
-			}
-			p++;
-		}
-		if (*p) {
+		int ret = md5_parse(md5pass, gMountOptions.md5pass);
+		if (ret < 0) {
 			fprintf(stderr,"bad md5 definition (md5 should be given as 32 hex digits)\n");
 			return 1;
 		}
@@ -186,6 +161,7 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 		openlog(STR(APPNAME), LOG_PID | LOG_NDELAY, LOG_USER);
 #endif
 	}
+	lzfs::add_log_syslog();
 
 	rls.rlim_cur = gMountOptions.nofile;
 	rls.rlim_max = gMountOptions.nofile;
@@ -223,6 +199,8 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 		}
 		close(piped[0]);
 		s=1;
+	} else {
+		lzfs::add_log_stderr(lzfs::log_level::debug);
 	}
 
 
@@ -269,7 +247,6 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 	params.attr_cache_timeout = gMountOptions.attrcacheto;
 	params.mkdir_copy_sgid = gMountOptions.mkdircopysgid;
 	params.sugid_clear_mode = gMountOptions.sugidclearmode;
-	params.acl_enabled = gMountOptions.acl;
 	params.use_rw_lock = gMountOptions.rwlock;
 	params.acl_cache_timeout = gMountOptions.aclcacheto;
 	params.acl_cache_size = gMountOptions.aclcachesize;
@@ -289,6 +266,7 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 		}
 	} else {
 		masterproxy_init();
+		symlink_cache_init();
 		if (gMountOptions.delayedinit) {
 			fs_init_master_connection(params);
 		} else {
@@ -342,13 +320,13 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 			}
 			close(piped[1]);
 		}
-		if (gMountOptions.meta==0) {
-			write_data_term();
-			read_data_term();
+		if (gMountOptions.meta == 0) {
+			LizardClient::fs_term();
+		} else {
+			masterproxy_term();
+			fs_term();
+			symlink_cache_term();
 		}
-		masterproxy_term();
-		fs_term();
-		symlink_cache_term();
 		return 1;
 	}
 
@@ -365,13 +343,13 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 			}
 			close(piped[1]);
 		}
-		if (gMountOptions.meta==0) {
-			write_data_term();
-			read_data_term();
+		if (gMountOptions.meta == 0) {
+			LizardClient::fs_term();
+		} else {
+			masterproxy_term();
+			fs_term();
+			symlink_cache_term();
 		}
-		masterproxy_term();
-		fs_term();
-		symlink_cache_term();
 		return 1;
 	}
 
@@ -403,13 +381,13 @@ int mainloop(struct fuse_args *args,const char* mp,int mt,int fg) {
 	fuse_session_remove_chan(ch);
 	fuse_session_destroy(se);
 	fuse_unmount(mp,ch);
-	if (gMountOptions.meta==0) {
-		write_data_term();
-		read_data_term();
+	if (gMountOptions.meta == 0) {
+		LizardClient::fs_term();
+	} else {
+		masterproxy_term();
+		fs_term();
+		symlink_cache_term();
 	}
-	masterproxy_term();
-	fs_term();
-	symlink_cache_term();
 	return err ? 1 : 0;
 }
 

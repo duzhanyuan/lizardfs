@@ -22,15 +22,92 @@
 
 #include "common/syslog_defs.h"
 
+#ifndef _WIN32
+#define SPDLOG_ENABLE_SYSLOG
+#endif
+#include "common/small_vector.h"
+#include "spdlog/spdlog.h"
+
+typedef std::shared_ptr<spdlog::logger> LoggerPtr;
+
+namespace lzfs {
+namespace log_level {
+enum LogLevel {
+	trace = spdlog::level::trace,
+	debug = spdlog::level::debug,
+	info = spdlog::level::info,
+	warn = spdlog::level::warn,
+	err = spdlog::level::err,
+	critical = spdlog::level::critical,
+	off = spdlog::level::off
+};
+} // namespace level
+
+template<typename FormatType, typename... Args>
+void log(log_level::LogLevel log_level, const FormatType &format, Args&&... args) {
+	//NOTICE(sarna): Workaround for old GCC, which has issues with args... inside lambdas
+	small_vector<LoggerPtr, 8> loggers;
+	spdlog::apply_all([&loggers](LoggerPtr l) {
+		loggers.push_back(l);
+	});
+	for (LoggerPtr &logger : loggers) {
+		logger->log((spdlog::level::level_enum)log_level, format, std::forward<Args>(args)...);
+	}
+}
+
+template<typename FormatType, typename... Args>
+void log_trace(const FormatType &format, Args&&... args) {
+	log(log_level::trace, format, std::forward<Args>(args)...);
+}
+
+template<typename FormatType, typename... Args>
+void log_debug(const FormatType &format, Args&&... args) {
+	log(log_level::debug, format, std::forward<Args>(args)...);
+}
+
+template<typename FormatType, typename... Args>
+void log_info(const FormatType &format, Args&&... args) {
+	log(log_level::info, format, std::forward<Args>(args)...);
+}
+
+template<typename FormatType, typename... Args>
+void log_warn(const FormatType &format, Args&&... args) {
+	log(log_level::warn, format, std::forward<Args>(args)...);
+}
+
+template<typename FormatType, typename... Args>
+void log_err(const FormatType &format, Args&&... args) {
+	log(log_level::err, format, std::forward<Args>(args)...);
+}
+
+template<typename FormatType, typename... Args>
+void log_critical(const FormatType &format, Args&&... args) {
+	log(log_level::critical, format, std::forward<Args>(args)...);
+}
+
+bool add_log_file(const char *path, log_level::LogLevel level, int max_file_size, int max_file_count);
+void set_log_flush_on(log_level::LogLevel level);
+void drop_all_logs();
+bool add_log_syslog();
+bool add_log_stderr(log_level::LogLevel level);
+
+} // namespace lzfs
+
+// NOTICE(sarna) Old interface, don't use unless extern-C is needed
 extern "C" {
-/// Returns true iff lzfs_*log functions print messages to stderr.
-bool lzfs_is_printf_enabled();
 
-/// Enables printing into stderr in lzfs_*log functions.
-void lzfs_disable_printf();
+/// Adds custom logging file
+bool lzfs_add_log_file(const char *path, int priority, int max_file_size, int max_file_count);
 
-/// Disables printing into stderr in lzfs_*log functions.
-void lzfs_enable_printf();
+/// Sets which level triggers immediate log flush (default: CRITICAL)
+void lzfs_set_log_flush_on(int priority);
+
+/// Removes all log files
+void lzfs_drop_all_logs();
+
+bool lzfs_add_log_syslog();
+
+bool lzfs_add_log_stderr(int priority);
 
 /*
  * function names may contain following words:

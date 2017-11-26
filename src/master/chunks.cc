@@ -418,6 +418,10 @@ public:
 		return allAvailabilityState_ == ChunksAvailabilityState::kLost;
 	}
 
+	bool isWritable() {
+		return !isLost();
+	}
+
 	int countMissingParts() const {
 		return allMissingParts_;
 	}
@@ -663,10 +667,10 @@ static void chunk_update_checksum(Chunk *ch) {
 	removeFromChecksum(gChunksMetadata->chunksChecksum, ch->checksum);
 	ch->checksum = chunk_checksum(ch);
 	if (HASHPOS(ch->chunkid) < gChunksMetadata->checksumRecalculationPosition) {
-		DEBUG_LOG("master.fs.checksum.changing_recalculated_chunk");
+		lzfs_silent_syslog(LOG_DEBUG, "master.fs.checksum.changing_recalculated_chunk");
 		addToChecksum(gChunksMetadata->chunksChecksumRecalculated, ch->checksum);
 	} else {
-		DEBUG_LOG("master.fs.checksum.changing_not_recalculated_chunk");
+		lzfs_silent_syslog(LOG_DEBUG, "master.fs.checksum.changing_not_recalculated_chunk");
 	}
 	addToChecksum(gChunksMetadata->chunksChecksum, ch->checksum);
 }
@@ -696,8 +700,8 @@ ChecksumRecalculationStatus chunks_update_checksum_a_bit(uint32_t speedLimit) {
 	// Recalculating chunks checksum finished
 	gChunksMetadata->checksumRecalculationPosition = 0;
 	if (gChunksMetadata->chunksChecksum != gChunksMetadata->chunksChecksumRecalculated) {
-		syslog(LOG_WARNING,"Chunks metadata checksum mismatch found, replacing with a new value.");
-		DEBUG_LOG("master.fs.checksum.mismatch");
+		lzfs_pretty_syslog(LOG_WARNING,"Chunks metadata checksum mismatch found, replacing with a new value.");
+		lzfs_silent_syslog(LOG_DEBUG, "master.fs.checksum.mismatch");
 		gChunksMetadata->chunksChecksum = gChunksMetadata->chunksChecksumRecalculated;
 	}
 	return ChecksumRecalculationStatus::kDone;
@@ -768,12 +772,7 @@ Chunk *chunk_new(uint64_t chunkid, uint32_t chunkversion) {
 
 #ifndef METARESTORE
 void chunk_emergency_increase_version(Chunk *c) {
-	if (c->isLost()) { // should always be false !!!
-		syslog(LOG_ERR, "chunk_emergency_increase_version called on a lost chunk");
-		matoclserv_chunk_status(c->chunkid, LIZARDFS_ERROR_CHUNKLOST);
-		c->operation = Chunk::NONE;
-		return;
-	}
+	assert(c->isWritable());
 	uint32_t i = 0;
 	for (auto &part : c->parts) {
 		if (part.is_valid()) {
@@ -786,17 +785,11 @@ void chunk_emergency_increase_version(Chunk *c) {
 			i++;
 		}
 	}
-	if (i>0) { // should always be true !!!
-		c->interrupted = 0;
-		c->operation = Chunk::SET_VERSION;
-		c->version++;
-		chunk_update_checksum(c);
-		fs_incversion(c->chunkid);
-	} else {
-		syslog(LOG_ERR, "chunk %016" PRIX64 " lost in emergency increase version", c->chunkid);
-		matoclserv_chunk_status(c->chunkid, LIZARDFS_ERROR_CHUNKLOST);
-		c->operation = Chunk::NONE;
-	}
+	c->interrupted = 0;
+	c->operation = Chunk::SET_VERSION;
+	c->version++;
+	chunk_update_checksum(c);
+	fs_incversion(c->chunkid);
 }
 
 void chunk_handle_disconnected_copies(Chunk *c) {
@@ -818,7 +811,7 @@ void chunk_handle_disconnected_copies(Chunk *c) {
 		if (any_copy_busy) {
 			c->interrupted = 1;
 		} else {
-			if (!c->isLost()) {
+			if (c->isWritable()) {
 				chunk_emergency_increase_version(c);
 			} else {
 				matoclserv_chunk_status(c->chunkid,LIZARDFS_ERROR_NOTDONE);
@@ -909,7 +902,7 @@ int chunk_change_file(uint64_t chunkid,uint8_t prevgoal,uint8_t newgoal) {
 	try {
 		c->changeFileGoal(prevgoal, newgoal);
 	} catch (Exception& ex) {
-		syslog(LOG_WARNING, "chunk_change_file: %s", ex.what());
+		lzfs_pretty_syslog(LOG_WARNING, "chunk_change_file: %s", ex.what());
 		return LIZARDFS_ERROR_CHUNKLOST;
 	}
 	chunk_update_checksum(c);
@@ -921,7 +914,7 @@ static inline int chunk_delete_file_int(Chunk *c, uint8_t goal) {
 	try {
 		c->removeFileWithGoal(goal);
 	} catch (Exception& ex) {
-		syslog(LOG_WARNING, "chunk_delete_file_int: %s", ex.what());
+		lzfs_pretty_syslog(LOG_WARNING, "chunk_delete_file_int: %s", ex.what());
 		return LIZARDFS_ERROR_CHUNKLOST;
 	}
 	chunk_update_checksum(c);
@@ -933,7 +926,7 @@ static inline int chunk_add_file_int(Chunk *c, uint8_t goal) {
 	try {
 		c->addFileWithGoal(goal);
 	} catch (Exception& ex) {
-		syslog(LOG_WARNING, "chunk_add_file_int: %s", ex.what());
+		lzfs_pretty_syslog(LOG_WARNING, "chunk_add_file_int: %s", ex.what());
 		return LIZARDFS_ERROR_CHUNKLOST;
 	}
 	chunk_update_checksum(c);
@@ -1097,7 +1090,7 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 		if (*lockid == 0 && oc->isLocked()) {
 			return LIZARDFS_ERROR_LOCKED;
 		}
-		if (oc->isLost()) {
+		if (!oc->isWritable()) {
 			return LIZARDFS_ERROR_CHUNKLOST;
 		}
 		ChunkCopiesCalculator calculator(oc->getGoal());
@@ -1116,7 +1109,7 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 				return LIZARDFS_ERROR_CHUNKBUSY;
 			}
 			if (c->needverincrease) {
-				uint32_t i = 0;
+				assert(c->isWritable());
 				for (auto &part : c->parts) {
 					if (part.is_valid()) {
 						if (!part.is_busy()) {
@@ -1125,54 +1118,39 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 						part.version = c->version+1;
 						matocsserv_send_setchunkversion(part.server(), ochunkid, c->version+1, c->version,
 								part.type);
-						i++;
 					}
 				}
-				if (i>0) {
-					c->interrupted = 0;
-					c->operation = Chunk::SET_VERSION;
-					c->version++;
-					*opflag=1;
-				} else {
-					// This should never happen - we verified this using ChunkCopiesCalculator
-					return LIZARDFS_ERROR_CHUNKLOST;
-				}
+				c->interrupted = 0;
+				c->operation = Chunk::SET_VERSION;
+				c->version++;
+				*opflag=1;
 			} else {
 				*opflag=0;
 			}
 		} else {
 			if (oc->fileCount() == 0) { // it's serious structure error
-				syslog(LOG_WARNING,"serious structure inconsistency: (chunkid:%016" PRIX64 ")",ochunkid);
+				lzfs_pretty_syslog(LOG_WARNING,"serious structure inconsistency: (chunkid:%016" PRIX64 ")",ochunkid);
 				return LIZARDFS_ERROR_CHUNKLOST; // ERROR_STRUCTURE
 			}
 			if (quota_exceeded) {
 				return LIZARDFS_ERROR_QUOTA;
 			}
-			uint32_t i = 0;
+			assert(oc->isWritable());
+			c = chunk_new(gChunksMetadata->nextchunkid++, 1);
+			c->interrupted = 0;
+			c->operation = Chunk::DUPLICATE;
+			chunk_delete_file_int(oc,goal);
+			chunk_add_file_int(c,goal);
 			for (const auto &old_part : oc->parts) {
 				if (old_part.is_valid()) {
-					if (c==NULL) {
-						c = chunk_new(gChunksMetadata->nextchunkid++, 1);
-						c->interrupted = 0;
-						c->operation = Chunk::DUPLICATE;
-						chunk_delete_file_int(oc,goal);
-						chunk_add_file_int(c,goal);
-					}
 					c->parts.push_back(ChunkPart(old_part.csid, ChunkPart::BUSY, c->version, old_part.type));
 					matocsserv_send_duplicatechunk(old_part.server(), c->chunkid, c->version, old_part.type,
 							oc->chunkid, oc->version);
-					i++;
 				}
 			}
-			if (c!=NULL) {
-				c->updateStats();
-			}
-			if (i>0) {
-				*nchunkid = c->chunkid;
-				*opflag=1;
-			} else {
-				return LIZARDFS_ERROR_CHUNKLOST;
-			}
+			c->updateStats();
+			*nchunkid = c->chunkid;
+			*opflag=1;
 		}
 	}
 
@@ -1191,13 +1169,15 @@ uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
 
 uint8_t chunk_multi_truncate(uint64_t ochunkid, uint32_t lockid, uint32_t length,
 		uint8_t goal, bool denyTruncatingParityParts, bool quota_exceeded, uint64_t *nchunkid) {
-	uint32_t i;
 	Chunk *oc, *c;
 
 	c=NULL;
 	oc = chunk_find(ochunkid);
 	if (oc==NULL) {
 		return LIZARDFS_ERROR_NOCHUNK;
+	}
+	if (!oc->isWritable()) {
+		return LIZARDFS_ERROR_CHUNKLOST;
 	}
 	if (oc->isLocked() && (lockid == 0 || lockid != oc->lockid)) {
 		return LIZARDFS_ERROR_LOCKED;
@@ -1215,7 +1195,7 @@ uint8_t chunk_multi_truncate(uint64_t ochunkid, uint32_t lockid, uint32_t length
 		if (c->operation != Chunk::NONE) {
 			return LIZARDFS_ERROR_CHUNKBUSY;
 		}
-		i=0;
+		assert(c->isWritable());
 		for (auto &part : c->parts) {
 			if (part.is_valid()) {
 				if (!part.is_busy()) {
@@ -1226,49 +1206,36 @@ uint8_t chunk_multi_truncate(uint64_t ochunkid, uint32_t lockid, uint32_t length
 						slice_traits::chunkLengthToChunkPartLength(part.type, length);
 				matocsserv_send_truncatechunk(part.server(), ochunkid, part.type, chunkTypeLength,
 						c->version + 1, c->version);
-				i++;
 			}
 		}
-		if (i>0) {
-			c->interrupted = 0;
-			c->operation = Chunk::TRUNCATE;
-			c->version++;
-		} else {
-			return LIZARDFS_ERROR_CHUNKLOST;
-		}
+		c->interrupted = 0;
+		c->operation = Chunk::TRUNCATE;
+		c->version++;
 	} else {
 		if (oc->fileCount() == 0) { // it's serious structure error
-			syslog(LOG_WARNING,"serious structure inconsistency: (chunkid:%016" PRIX64 ")",ochunkid);
+			lzfs_pretty_syslog(LOG_WARNING,"serious structure inconsistency: (chunkid:%016" PRIX64 ")",ochunkid);
 			return LIZARDFS_ERROR_CHUNKLOST; // ERROR_STRUCTURE
 		}
 		if (quota_exceeded) {
 			return LIZARDFS_ERROR_QUOTA;
 		}
-		i=0;
+
+		assert(oc->isWritable());
+		c = chunk_new(gChunksMetadata->nextchunkid++, 1);
+		c->interrupted = 0;
+		c->operation = Chunk::DUPTRUNC;
+		chunk_delete_file_int(oc,goal);
+		chunk_add_file_int(c,goal);
 		for (const auto &old_part : oc->parts) {
 			if (old_part.is_valid()) {
-				if (c==NULL) {
-					c = chunk_new(gChunksMetadata->nextchunkid++, 1);
-					c->interrupted = 0;
-					c->operation = Chunk::DUPTRUNC;
-					chunk_delete_file_int(oc,goal);
-					chunk_add_file_int(c,goal);
-				}
 				c->parts.push_back(ChunkPart(old_part.csid, ChunkPart::BUSY, c->version, old_part.type));
 				matocsserv_send_duptruncchunk(old_part.server(), c->chunkid, c->version,
 						old_part.type, oc->chunkid, oc->version,
 						slice_traits::chunkLengthToChunkPartLength(old_part.type, length));
-				i++;
 			}
 		}
-		if (c!=NULL) {
-			c->updateStats();
-		}
-		if (i>0) {
-			*nchunkid = c->chunkid;
-		} else {
-			return LIZARDFS_ERROR_CHUNKLOST;
-		}
+		c->updateStats();
+		*nchunkid = c->chunkid;
 	}
 
 	c->lockedto=(uint32_t)eventloop_time()+LOCKTIMEOUT;
@@ -1290,7 +1257,7 @@ uint8_t chunk_apply_modification(uint32_t ts, uint64_t oldChunkId, uint32_t lock
 			return LIZARDFS_ERROR_NOCHUNK;
 		}
 		if (oc->fileCount() == 0) { // refcount == 0
-			syslog(LOG_WARNING,
+			lzfs_pretty_syslog(LOG_WARNING,
 					"serious structure inconsistency: (chunkid:%016" PRIX64 ")", oldChunkId);
 			return LIZARDFS_ERROR_CHUNKLOST; // ERROR_STRUCTURE
 		} else if (oc->fileCount() == 1) { // refcount == 1
@@ -1410,7 +1377,7 @@ uint8_t chunk_set_next_chunkid(uint64_t nextChunkIdToBeSet) {
 		gChunksMetadata->nextchunkid = nextChunkIdToBeSet;
 		return LIZARDFS_STATUS_OK;
 	} else {
-		syslog(LOG_WARNING,"was asked to increase the next chunk id to %" PRIu64 ", but it was"
+		lzfs_pretty_syslog(LOG_WARNING,"was asked to increase the next chunk id to %" PRIu64 ", but it was"
 				"already set to a bigger value %" PRIu64 ". Ignoring.",
 				nextChunkIdToBeSet, gChunksMetadata->nextchunkid);
 		return LIZARDFS_ERROR_MISMATCH;
@@ -1564,7 +1531,7 @@ void chunk_server_has_chunk(matocsserventry *ptr, uint64_t chunkid, uint32_t ver
 				break;
 			}
 			if (part.version != new_version) {
-				syslog(LOG_WARNING, "chunk %016" PRIX64 ": master data indicated "
+				lzfs_pretty_syslog(LOG_WARNING, "chunk %016" PRIX64 ": master data indicated "
 						"version %08" PRIX32 ", chunkserver reports %08"
 						PRIX32 "!!! Updating master data.", c->chunkid,
 						part.version, new_version);
@@ -1722,7 +1689,7 @@ void chunk_got_replicate_status(matocsserventry *ptr, uint64_t chunkId, uint32_t
 	auto server_csid = matocsserv_get_csdb(ptr)->csid;
 	for (auto &part : c->parts) {
 		if (part.type == chunkType && part.csid == server_csid) {
-			syslog(LOG_WARNING,
+			lzfs_pretty_syslog(LOG_WARNING,
 					"got replication status from server which had had that chunk before (chunk:%016"
 					PRIX64 "_%08" PRIX32 ")", chunkId, chunkVersion);
 			if (part.state == ChunkPart::VALID && chunkVersion != c->version) {
@@ -1754,7 +1721,7 @@ void chunk_operation_status(Chunk *c, ChunkPartType chunkType, uint8_t status,ma
 		any_copy_busy |= part.is_busy();
 	}
 	if (!any_copy_busy) {
-		if (!c->isLost()) {
+		if (c->isWritable()) {
 			if (c->interrupted) {
 				chunk_emergency_increase_version(c);
 			} else {
@@ -1904,20 +1871,20 @@ void ChunkWorker::doEveryLoopTasks() {
 		if ((deleteNotDone_ > deleteDone_) && (toDeleteCount > prevToDeleteCount_)) {
 			TmpMaxDelFrac *= 1.5;
 			if (TmpMaxDelFrac>MaxDelHardLimit) {
-				syslog(LOG_NOTICE,"DEL_LIMIT hard limit (%" PRIu32 " per server) reached",MaxDelHardLimit);
+				lzfs_pretty_syslog(LOG_NOTICE,"DEL_LIMIT hard limit (%" PRIu32 " per server) reached",MaxDelHardLimit);
 				TmpMaxDelFrac=MaxDelHardLimit;
 			}
 			TmpMaxDel = TmpMaxDelFrac;
-			syslog(LOG_NOTICE,"DEL_LIMIT temporary increased to: %" PRIu32 " per server",TmpMaxDel);
+			lzfs_pretty_syslog(LOG_NOTICE,"DEL_LIMIT temporary increased to: %" PRIu32 " per server",TmpMaxDel);
 		}
 		if ((toDeleteCount < prevToDeleteCount_) && (TmpMaxDelFrac > MaxDelSoftLimit)) {
 			TmpMaxDelFrac /= 1.5;
 			if (TmpMaxDelFrac<MaxDelSoftLimit) {
-				syslog(LOG_NOTICE,"DEL_LIMIT back to soft limit (%" PRIu32 " per server)",MaxDelSoftLimit);
+				lzfs_pretty_syslog(LOG_NOTICE,"DEL_LIMIT back to soft limit (%" PRIu32 " per server)",MaxDelSoftLimit);
 				TmpMaxDelFrac = MaxDelSoftLimit;
 			}
 			TmpMaxDel = TmpMaxDelFrac;
-			syslog(LOG_NOTICE,"DEL_LIMIT decreased back to: %" PRIu32 " per server",TmpMaxDel);
+			lzfs_pretty_syslog(LOG_NOTICE,"DEL_LIMIT decreased back to: %" PRIu32 " per server",TmpMaxDel);
 		}
 		prevToDeleteCount_ = toDeleteCount;
 		deleteNotDone_ = 0;
@@ -2024,7 +1991,7 @@ void ChunkWorker::deleteInvalidChunkParts(Chunk *c) {
 		if (matocsserv_deletion_counter(part.server()) < TmpMaxDel) {
 			if (!part.is_valid()) {
 				if (part.state == ChunkPart::DEL) {
-					syslog(LOG_WARNING,
+					lzfs_pretty_syslog(LOG_WARNING,
 					       "chunk hasn't been deleted since previous loop - "
 					       "retry");
 				}
@@ -2144,6 +2111,13 @@ bool ChunkWorker::replicateChunkPart(Chunk *c, Goal::Slice::Type slice_type, int
 				// non-matching
 				// labels as our destination -- we will wait for that server to be
 				// ready.
+				skipped_replications += label_and_count.second;
+				continue;
+			}
+			if (!RebalancingBetweenLabels && !c->isEndangered()
+			    && calc.isSafeEnoughToWrite(gRedundancyLevel)) {
+				// Chunk is not endangered, so we should prevent label spilling.
+				// Only endangered chunks will be replicated across labels.
 				skipped_replications += label_and_count.second;
 				continue;
 			}
@@ -2428,15 +2402,14 @@ void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 	}
 
 	// step 2. check number of copies
-	if (c->isLost() && invalid_parts > 0 && calc.getAvailable().getExpectedCopies() == 0 &&
-	    c->fileCount() > 0) {
-		syslog(LOG_WARNING, "chunk %016" PRIX64
-		                    " has only invalid copies (%d) - please repair it manually",
-		       c->chunkid, invalid_parts);
+	if (c->isLost() && invalid_parts > 0 && c->fileCount() > 0) {
+		lzfs_pretty_syslog(LOG_WARNING, "chunk %016lx has not enough valid parts (%d)"
+		                   " consider repairing it manually", c->chunkid, invalid_parts);
 		for (const auto &part : c->parts) {
-			syslog(LOG_NOTICE, "chunk %016" PRIX64 "_%08" PRIX32
-			                   " - invalid copy on (%s - ver:%08" PRIX32 ")",
-			       c->chunkid, c->version, matocsserv_getstrip(part.server()), part.version);
+			if (!part.is_valid()) {
+				lzfs_pretty_syslog(LOG_NOTICE, "chunk %016lx_%08x - invalid part on (%s - ver:%08x)",
+				c->chunkid, c->version, matocsserv_getstrip(part.server()), part.version);
+			}
 		}
 		return;
 	}
@@ -2452,7 +2425,7 @@ void ChunkWorker::doChunkJobs(Chunk *c, uint16_t serverCount) {
 	// step 5. check busy count
 	for (const auto &part : c->parts) {
 		if (part.is_busy()) {
-			syslog(LOG_WARNING, "chunk %016" PRIX64 " has unexpected BUSY copies",
+			lzfs_pretty_syslog(LOG_WARNING, "chunk %016" PRIX64 " has unexpected BUSY copies",
 			       c->chunkid);
 			return;
 		}
@@ -2832,7 +2805,7 @@ void chunk_reload(void) {
 			MaxDelHardLimit = cfg_getuint32("CHUNKS_HARD_DEL_LIMIT",25);
 			if (MaxDelHardLimit<MaxDelSoftLimit) {
 				MaxDelSoftLimit = MaxDelHardLimit;
-				syslog(LOG_WARNING,"CHUNKS_SOFT_DEL_LIMIT is greater than CHUNKS_HARD_DEL_LIMIT - using CHUNKS_HARD_DEL_LIMIT for both");
+				lzfs_pretty_syslog(LOG_WARNING,"CHUNKS_SOFT_DEL_LIMIT is greater than CHUNKS_HARD_DEL_LIMIT - using CHUNKS_HARD_DEL_LIMIT for both");
 			}
 		} else {
 			MaxDelHardLimit = 3 * MaxDelSoftLimit;

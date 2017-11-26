@@ -23,6 +23,7 @@
 
 #include "lizardfs_c_api.h"
 #include "common/lizardfs_error_codes.h"
+#include "common/md5.h"
 #include "common/small_vector.h"
 #include "mount/client/iovec_traits.h"
 
@@ -40,6 +41,7 @@ void liz_set_default_init_params(struct liz_init_params *params,
 	params->mountpoint = mountpoint;
 	params->subfolder = LizardClient::FsInitParams::kDefaultSubfolder;
 	params->password = nullptr;
+	params->md5_pass = nullptr;
 	params->do_not_remember_password = LizardClient::FsInitParams::kDefaultDoNotRememberPassword;
 	params->delayed_init = LizardClient::FsInitParams::kDefaultDelayedInit;
 	params->report_reserved_period = LizardClient::FsInitParams::kDefaultReportReservedPeriod;
@@ -69,7 +71,6 @@ void liz_set_default_init_params(struct liz_init_params *params,
 	params->attr_cache_timeout = LizardClient::FsInitParams::kDefaultAttrCacheTimeout;
 	params->mkdir_copy_sgid = LizardClient::FsInitParams::kDefaultMkdirCopySgid;
 	params->sugid_clear_mode = (liz_sugid_clear_mode)LizardClient::FsInitParams::kDefaultSugidClearMode;
-	params->acl_enabled = LizardClient::FsInitParams::kDefaultAclEnabled;
 	params->use_rw_lock = LizardClient::FsInitParams::kDefaultUseRwLock;
 	params->acl_cache_timeout = LizardClient::FsInitParams::kDefaultAclCacheTimeout;
 	params->acl_cache_size = LizardClient::FsInitParams::kDefaultAclCacheSize;
@@ -97,11 +98,7 @@ void liz_set_default_init_params(struct liz_init_params *params,
 	}
 }
 
-#ifdef LIZARDFS_HAVE_THREAD_LOCAL
 static thread_local liz_err_t gLastErrorCode(LIZARDFS_STATUS_OK);
-#else
-static __thread liz_err_t gLastErrorCode(LIZARDFS_STATUS_OK);
-#endif
 
 static void to_entry(const Client::EntryParam &param, liz_entry *entry) {
 	assert(entry);
@@ -168,6 +165,11 @@ void liz_destroy_context(liz_context_t *ctx) {
 	delete client_ctx;
 }
 
+void liz_set_lock_owner(liz_fileinfo_t *fileinfo, uint64_t lock_owner) {
+	Client::FileInfo *fi = (Client::FileInfo *)fileinfo;
+	fi->lock_owner = lock_owner;
+}
+
 liz_t *liz_init(const char *host, const char *port, const char *mountpoint) {
 	try {
 		Client *ret = new Client(host, port, mountpoint);
@@ -195,8 +197,17 @@ liz_t *liz_init_with_params(struct liz_init_params *params) {
 		init_params.subfolder = params->subfolder;
 	}
 	if (params->password != nullptr) {
-		init_params.password_digest.assign(params->password,
-				params->password + strlen(params->password));
+		md5ctx md5_ctx;
+		init_params.password_digest.resize(16);
+		md5_init(&md5_ctx);
+		md5_update(&md5_ctx,(uint8_t *)(params->password), strlen(params->password));
+		md5_final(init_params.password_digest.data(), &md5_ctx);
+	} else if (params->md5_pass) {
+		int ret = md5_parse(init_params.password_digest, params->md5_pass);
+		if (ret < 0) {
+			gLastErrorCode = LIZARDFS_ERROR_EINVAL;
+			return nullptr;
+		}
 	}
 
 	#define COPY_PARAM(PARAM) do { \
@@ -230,7 +241,6 @@ liz_t *liz_init_with_params(struct liz_init_params *params) {
 		COPY_PARAM(attr_cache_timeout);
 		COPY_PARAM(mkdir_copy_sgid);
 		init_params.sugid_clear_mode = (SugidClearMode)params->sugid_clear_mode;
-		COPY_PARAM(acl_enabled);
 		COPY_PARAM(use_rw_lock);
 		COPY_PARAM(acl_cache_timeout);
 		COPY_PARAM(acl_cache_size);
@@ -978,4 +988,74 @@ void liz_destroy_chunks_info(liz_chunk_info_t *buffer) {
 	if (buffer && buffer->parts) {
 		std::free(buffer->parts);
 	}
+}
+
+int liz_setlk(liz_t *instance, liz_context_t *ctx, liz_fileinfo_t *fileinfo,
+	      const liz_lock_info *lock, liz_lock_register_interrupt_t handler, void *priv) {
+	Client &client = *(Client *)instance;
+	Client::Context &context = *(Client::Context *)ctx;
+	Client::FileInfo *fi = (Client::FileInfo *)fileinfo;
+	gLastErrorCode = 0;
+
+	lzfs_locks::FlockWrapper flock_wrapper;
+	flock_wrapper.l_type = lock->l_type;
+	flock_wrapper.l_start = lock->l_start;
+	flock_wrapper.l_len = lock->l_len;
+	flock_wrapper.l_pid = lock->l_pid;
+	std::error_code ec;
+	liz_lock_interrupt_info_t interrupt_info;
+	std::function<int(const lzfs_locks::InterruptData &)> lambda;
+	if (handler) {
+		lambda = [&handler, &interrupt_info, priv](const lzfs_locks::InterruptData &data) {
+			interrupt_info.owner = data.owner;
+			interrupt_info.ino = data.ino;
+			interrupt_info.reqid = data.reqid;
+			return handler(&interrupt_info, priv);
+		};
+	}
+	client.setlk(context, fi->inode, fi, flock_wrapper, lambda, ec);
+	gLastErrorCode = ec.value();
+	return ec ? -1 : 0;
+}
+
+int liz_getlk(liz_t *instance, liz_context_t *ctx, liz_fileinfo_t *fileinfo, liz_lock_info *lock) {
+	Client &client = *(Client *)instance;
+	Client::Context &context = *(Client::Context *)ctx;
+	Client::FileInfo *fi = (Client::FileInfo *)fileinfo;
+	gLastErrorCode = 0;
+
+	lzfs_locks::FlockWrapper flock_wrapper;
+	flock_wrapper.l_type = lock->l_type;
+	flock_wrapper.l_start = lock->l_start;
+	flock_wrapper.l_len = lock->l_len;
+	flock_wrapper.l_pid = lock->l_pid;
+	std::error_code ec;
+	client.getlk(context, fi->inode, fi, flock_wrapper, ec);
+	if (ec) {
+		gLastErrorCode = ec.value();
+		return -1;
+	}
+	lock->l_type = flock_wrapper.l_type;
+	lock->l_start = flock_wrapper.l_start;
+	lock->l_len = flock_wrapper.l_len;
+	lock->l_pid = flock_wrapper.l_pid;
+	return 0;
+}
+
+int liz_setlk_interrupt(liz_t *instance, const liz_lock_interrupt_info_t *interrupt_info) {
+	if (interrupt_info == nullptr) {
+		return 0;
+	}
+	Client &client = *(Client *)instance;
+	lzfs_locks::InterruptData interrupt_data;
+	interrupt_data.owner = interrupt_info->owner;
+	interrupt_data.ino = interrupt_info->ino;
+	interrupt_data.reqid = interrupt_info->reqid;
+	std::error_code ec;
+	client.setlk_interrupt(interrupt_data, ec);
+	if (ec) {
+		gLastErrorCode = ec.value();
+		return -1;
+	}
+	return 0;
 }

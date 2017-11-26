@@ -1,7 +1,8 @@
 CHUNKSERVERS=$NUMBER_OF_CHUNKSERVERS \
 	USE_RAMDISK=YES \
 	MOUNT_EXTRA_CONFIG="mfscachemode=NEVER" \
-	MASTER_EXTRA_CONFIG="CHUNKS_LOOP_TIME = 1|OPERATIONS_DELAY_INIT = 0|ACCEPTABLE_DIFFERENCE = 10.0" \
+	MASTER_EXTRA_CONFIG="CHUNKS_LOOP_TIME = 1|OPERATIONS_DELAY_INIT = 0|`
+	`ACCEPTABLE_DIFFERENCE = 10.0|REDUNDANCY_LEVEL = 10|CHUNKS_REBALANCING_BETWEEN_LABELS = 1" \
 	setup_local_empty_lizardfs info
 
 cd "${info[mount0]}"
@@ -86,12 +87,12 @@ fi
 # After verifying that all chunks that should be created were created, remove all the old copies
 # and restart chunkservers to make them notice this removal
 for csid in $(seq 0 $(($NUMBER_OF_CHUNKSERVERS - 1))); do
-	mfschunkserver -c "${info[chunkserver${csid}_config]}" stop &
+	lizardfs_chunkserver_daemon $csid stop &
 done
 wait
 echo "$old_chunks" | xargs -d'\n' rm -f || true  # Some of the files might already be removed
 for csid in $(seq 0 $(($NUMBER_OF_CHUNKSERVERS - 1))); do
-	mfschunkserver -c "${info[chunkserver${csid}_config]}" start &
+	lizardfs_chunkserver_daemon $csid start &
 done
 wait
 
@@ -99,11 +100,10 @@ wait
 # (so hopefully we'll check if all the files that were created are valid)
 for csid in $(seq 0 $(($NUMBER_OF_CHUNKSERVERS - 1))); do
 	lizardfs_wait_for_all_ready_chunkservers
-	config=${info[chunkserver${csid}_config]}
-	mfschunkserver -c "${config}" stop
+	lizardfs_chunkserver_daemon $csid stop
 	for goal in $goals; do
 		file="dir_$goal/file"
 		file-validate "$file"
 	done
-	mfschunkserver -c "${config}" start
+	lizardfs_chunkserver_daemon $csid start
 done
