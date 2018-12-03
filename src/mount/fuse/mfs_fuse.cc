@@ -1,5 +1,5 @@
 /*
-   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2015 Skytechnology sp. z o.o..
+   Copyright 2005-2010 Jakub Kruszona-Zawadzki, Gemius SA, 2013-2014 EditShare, 2013-2018 Skytechnology sp. z o.o..
 
    This file was part of MooseFS and is part of LizardFS
 
@@ -24,14 +24,21 @@
 #include <type_traits>
 #include <vector>
 
+#include "common/lru_cache.h"
 #include "common/massert.h"
 #include "common/small_vector.h"
 #include "common/special_inode_defs.h"
+#include "common/time_utils.h"
 #include "mount/fuse/lock_conversion.h"
 #include "mount/lizard_client.h"
 #include "mount/lizard_client_context.h"
 #include "mount/thread_safe_map.h"
+#include "protocol/cltoma.h"
 #include "protocol/MFSCommunication.h"
+
+#include "grp.h"
+#include "pwd.h"
+#include "unistd.h"
 
 #if SPECIAL_INODE_ROOT != FUSE_ROOT_ID
 #error FUSE_ROOT_ID is not equal to SPECIAL_INODE_ROOT
@@ -55,7 +62,10 @@ void checkTypesEqual(const A& a, const B& b) {
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
 
-void getBsdGroups(LizardClient::Context &ctx) {
+static LizardClient::Context getSecondaryGroups(fuse_req_t &req) {
+	auto fuse_ctx = fuse_req_ctx(req);
+	LizardClient::Context ctx(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid, 0);
+
 	int mib_path[4];
 	struct kinfo_proc kinfo;
 	size_t len;
@@ -81,21 +91,17 @@ void getBsdGroups(LizardClient::Context &ctx) {
 		}
 #endif
 	}
+
+	return ctx;
 }
-#endif
 
-static void updateGroupsForContext(fuse_req_t &req, LizardClient::Context &ctx) {
-	static_assert(sizeof(gid_t) == sizeof(LizardClient::Context::IdType),
-	              "Invalid IdType to call fuse_req_getgroups");
-
-#if defined(__APPLE__) || defined(__FreeBSD__)
-	(void)req;
-	getBsdGroups(ctx);
-	LizardClient::updateGroups(ctx);
-#elif (FUSE_VERSION < 28)
-	(void)req, (void)ctx;
 #else
+
+static LizardClient::Context getSecondaryGroups(fuse_req_t &req) {
 	static const int kMaxGroups = GroupCache::kDefaultGroupsSize - 1;
+
+	auto fuse_ctx = fuse_req_ctx(req);
+	LizardClient::Context ctx(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid, 0);
 
 	assert(ctx.gids.size() == 1);
 	ctx.gids.resize(kMaxGroups + 1);
@@ -109,14 +115,45 @@ static void updateGroupsForContext(fuse_req_t &req, LizardClient::Context &ctx) 
 		// calls to fuse_req_getgroups
 		ctx.gids.resize(std::max(1, std::min<int>(getgroups_ret + 1, ctx.gids.size())));
 	}
-	LizardClient::updateGroups(ctx);
+
+	return ctx;
+}
+
 #endif
+
+typedef LruCache<
+	LruCacheOption::UseTreeMap,
+	LruCacheOption::Reentrant,
+	LizardClient::Context,
+	uint32_t> PidToContextCache;
+
+static PidToContextCache gPidToContextCache(std::chrono::seconds(10), 1024);
+
+static void updateGroupsForContext(fuse_req_t &req, LizardClient::Context &ctx) {
+	static_assert(sizeof(gid_t) == sizeof(LizardClient::Context::IdType),
+	              "Invalid IdType to call fuse_req_getgroups");
+
+	LizardClient::Context cached_context = gPidToContextCache.get(SteadyClock::now(), ctx.pid,
+		[&req](LizardClient::Context::IdType /*pid*/) { return getSecondaryGroups(req); });
+	if (!cached_context.isValid()) {
+		lzfs::log_warn("Failed to extract context information (secondary groups)");
+		return;
+	}
+	if (cached_context.uid != ctx.uid || cached_context.gid != ctx.gid) {
+		// uid and/or gid changed - this may happen due to setuid or other changes,
+		// so let's invalidate cache and try again
+		gPidToContextCache.erase(ctx.uid);
+		cached_context = gPidToContextCache.get(SteadyClock::now(), ctx.pid,
+			[&req](LizardClient::Context::IdType /*pid*/) { return getSecondaryGroups(req); });
+	}
+	ctx.gids = std::move(cached_context.gids);
+	LizardClient::updateGroups(ctx);
 }
 
 /**
- * A function converting fuse_ctx to LizardClient::Context
+ * A function converting fuse_ctx to LizardClient::Context (without secondary groups update)
  */
-LizardClient::Context get_context(fuse_req_t& req) {
+LizardClient::Context get_reduced_context(fuse_req_t& req) {
 	auto fuse_ctx = fuse_req_ctx(req);
 #if (FUSE_VERSION >= 28)
 	mode_t umask = fuse_ctx->umask;
@@ -124,11 +161,20 @@ LizardClient::Context get_context(fuse_req_t& req) {
 	mode_t umask = 0000;
 #endif
 	auto ret = LizardClient::Context(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid, umask);
-	if (fuse_ctx->pid > 0) {
+	return ret;
+}
+
+/**
+ * A function converting fuse_ctx to LizardClient::Context (with secondary groups update)
+ */
+LizardClient::Context get_context(fuse_req_t& req) {
+	auto ret = get_reduced_context(req);
+	if (ret.pid > 0) {
 		updateGroupsForContext(req, ret);
 	}
 	return ret;
 }
+
 
 /**
  * A wrapper that allows one to use fuse_file_info as if it was LizardClient::FileInfo object.
@@ -323,8 +369,14 @@ void mfs_readlink(fuse_req_t req, fuse_ino_t ino) {
 	}
 }
 
+#if FUSE_VERSION >= 30
+void mfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent,
+		const char *newname, unsigned int flags) {
+	(void)flags; // FIXME(haze) Add handling of RENAME_EXCHANGE FLAG
+#else
 void mfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent,
 		const char *newname) {
+#endif
 	try {
 		LizardClient::rename(get_context(req), parent, name, newparent, newname);
 		fuse_reply_err(req, 0);
@@ -443,11 +495,11 @@ void mfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fus
 	try {
 		if (LizardClient::isSpecialInode(ino)) {
 			auto ret = LizardClient::read_special_inode(
-				   get_context(req), ino, size, off, fuse_file_info_wrapper(fi));
+				   get_reduced_context(req), ino, size, off, fuse_file_info_wrapper(fi));
 			fuse_reply_buf(req, (char*) ret.data(), ret.size());
 		} else {
 			ReadCache::Result ret = LizardClient::read(
-					get_context(req), ino, size, off, fuse_file_info_wrapper(fi));
+					get_reduced_context(req), ino, size, off, fuse_file_info_wrapper(fi));
 
 			small_vector<struct iovec, 8> reply;
 			ret.toIoVec(reply, off, size);
@@ -462,7 +514,7 @@ void mfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off
 		struct fuse_file_info *fi) {
 	try {
 		fuse_reply_write(req, LizardClient::write(
-				get_context(req), ino, buf, size, off, fuse_file_info_wrapper(fi)));
+				get_reduced_context(req), ino, buf, size, off, fuse_file_info_wrapper(fi)));
 	} catch (LizardClient::RequestException& e) {
 		fuse_reply_err(req, e.system_error_code);
 	}
@@ -470,7 +522,7 @@ void mfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off
 
 void mfs_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 	try {
-		LizardClient::flush(get_context(req), ino, fuse_file_info_wrapper(fi));
+		LizardClient::flush(get_reduced_context(req), ino, fuse_file_info_wrapper(fi));
 		fuse_reply_err(req, 0);
 	} catch (LizardClient::RequestException& e) {
 		fuse_reply_err(req, e.system_error_code);
@@ -479,7 +531,7 @@ void mfs_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
 
 void mfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi) {
 	try {
-		LizardClient::fsync(get_context(req), ino, datasync, fuse_file_info_wrapper(fi));
+		LizardClient::fsync(get_reduced_context(req), ino, datasync, fuse_file_info_wrapper(fi));
 		fuse_reply_err(req, 0);
 	} catch (LizardClient::RequestException& e) {
 		fuse_reply_err(req, e.system_error_code);

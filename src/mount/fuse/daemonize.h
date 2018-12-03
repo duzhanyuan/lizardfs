@@ -1,5 +1,5 @@
 /*
-   Copyright 2017 Skytechnology sp. z o.o.
+   Copyright 2018 Skytechnology sp. z o.o.
 
    This file is part of LizardFS.
 
@@ -16,20 +16,12 @@
    along with LizardFS. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "mount/client/lizardfs_c_api.h" // must be first
-#include "common/richacl.h"
+#pragma once
 
-extern "C" {
+#include "common/platform.h"
 
-int lzfs_int_apply_masks(liz_acl_t *lzfs_acl, uint32_t owner) {
-	if (lzfs_acl) {
-		try {
-			((RichACL *)lzfs_acl)->applyMasks(owner);
-		} catch (...) {
-			return -1;
-		}
-	}
+#include <functional>
 
-	return 0;
-}
-}
+void daemonize_return_status(int status);
+int daemonize_and_wait(bool block_output, std::function<int ()> run_function);
+

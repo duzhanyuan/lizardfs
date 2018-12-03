@@ -149,7 +149,7 @@ set timeout for the whole communication with chunkservers during a read operatio
 set timeout for read cache entries to be considered valid in milliseconds (0 disables cache) (default: 0)
 
 *-o readaheadmaxwindowsize=*'KB'::
-set max value of readahead window per single descriptor in kibibytes (default: 4096)
+set max value of readahead window per single descriptor in kibibytes (default: 16384)
 
 *-o mfsrlimitnofile=*'N'::
 try to change limit of simultaneously opened file descriptors on startup
@@ -198,12 +198,12 @@ Allow or disallow execution of binaries.
 Set timeout value for symlink cache timeout in seconds. Default value is 3600.
 
 *-o bandwidthoveruse=*'N'::
-Define ratio of allowed bandwidth overuse when fetching data. Default value is 1.25.
+Define ratio of allowed bandwidth overuse when fetching data. Default value is 1.0.
 This option is effective only with N+M goals (xors and erasure codes).
 
 == DATA CACHE MODES
 
-There are three cache modes: *NO*, *YES* and *AUTO*. Default option is *AUTO* and you shuldn't
+There are three cache modes: *NO*, *YES* and *AUTO*. Default option is *AUTO* and you shouldn't
 change it unless you really know what you are doing. In *AUTO* mode data cache is managed
 automatically by mfsmaster.
 

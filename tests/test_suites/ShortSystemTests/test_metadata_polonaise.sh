@@ -1,4 +1,4 @@
-timeout_set '1 minute'
+timeout_set '3 minutes'
 CHUNKSERVERS=3 \
 	MOUNTS=1 \
 	USE_RAMDISK="YES" \
@@ -12,7 +12,7 @@ lizardfs-polonaise-server --master-host=localhost \
 sleep 3
 mnt="$TEMP_DIR/mfspolon"
 mkdir -p "$mnt"
-polonaise-fuse-client "$mnt" -o big_writes,allow_other &
+polonaise-fuse-client "$mnt" -o allow_other &
 MESSAGE="Client is not available" assert_eventually 'lizardfs dirinfo "$mnt"'
 
 cd "$mnt"

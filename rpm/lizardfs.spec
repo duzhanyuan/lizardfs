@@ -2,7 +2,7 @@
 
 Summary:        LizardFS - distributed, fault tolerant file system
 Name:           lizardfs
-Version:        3.12.0
+Version:        3.13.0
 Release:        0%{?distro}
 License:        GPL v3
 Group:          System Environment/Daemons
@@ -81,6 +81,14 @@ Requires:       bash-completion
 %description client
 LizardFS client: mfsmount and mfstools.
 
+%package client3
+Summary:        LizardFS client using FUSE3
+Group:          System Environment/Daemons
+Requires:       lizardfs-client
+
+%description client3
+LizardFS client: mfsmount and mfstools.
+
 %package lib-client
 Summary:        LizardFS client C/C++ library
 Group:          Development/Libraries
@@ -123,6 +131,17 @@ Group:          System Environment/Daemons
 
 %description adm
 LizardFS command line administration utility.
+
+%package uraft
+Summary:        LizardFS cluster management tool
+Group:          System Environment/Daemons
+Requires:       lizardfs-master
+Requires:       lizardfs-adm
+Requires:       boost-system
+Requires:       boost-program-options
+
+%description uraft
+LizardFS cluster management tool.
 
 # Scriptlets - master
 ############################################################
@@ -287,6 +306,23 @@ fi
 %systemd_postun_with_restart lizardfs-cgiserv.service
 %endif
 
+# Scriptlets - client3
+############################################################
+
+%post client3
+/bin/ln -s %{_mandir}/man1/mfsmount.1 %{_mandir}/man1/mfsmount3.1
+
+# Scriptlets - uraft
+############################################################
+
+%post uraft
+echo "net.ipv4.conf.all.arp_accept = 1" > /etc/sysctl.d/10-lizardfs-uraft-arp.conf
+chmod 0664 /etc/sysctl.d/10-lizardfs-uraft-arp.conf
+sysctl -p /etc/sysctl.d/10-lizardfs-uraft-arp.conf
+echo "# Allow mfs user to set floating ip" > /etc/sudoers.d/lizardfs-uraft
+echo "mfs    ALL=NOPASSWD:/sbin/ip" >> /etc/sudoers.d/lizardfs-uraft
+echo 'Defaults !requiretty' >> /etc/sudoers
+
 # Prep, build, install, files...
 ############################################################
 
@@ -438,6 +474,9 @@ rm -rf $RPM_BUILD_ROOT
 %{liz_confdir}/iolimits.cfg.dist
 %{_sysconfdir}/bash_completion.d/lizardfs
 
+%files client3
+%attr(755,root,root) %{_bindir}/mfsmount3
+
 %files lib-client
 %{_libdir}/liblizardfsmount_shared.so
 %{_libdir}/liblizardfs-client.so
@@ -486,9 +525,42 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/lizardfs-probe
 %{_mandir}/man8/lizardfs-probe.8*
 
+%files uraft
+%defattr(644,root,root,755)
+%attr(755,root,root) %{_sbindir}/lizardfs-uraft
+%attr(755,root,root) %{_sbindir}/lizardfs-uraft-helper
+%doc NEWS README.md UPGRADE
+%{_mandir}/man8/lizardfs-uraft.8*
+%{_mandir}/man8/lizardfs-uraft-helper.8*
+%{_mandir}/man5/lizardfs-uraft.cfg.5*
+%{liz_confdir}/lizardfs-uraft.cfg.dist
+%if "%{distro}" == "el6"
+%attr(754,root,root) %{_initrddir}/lizardfs-uraft
+%endif
+%if "%{distro}" == "el7"
+%attr(644,root,root) %{_unitdir}/lizardfs-uraft.service
+%attr(644,root,root) %{_unitdir}/lizardfs-ha-master.service
+%endif
+
 %changelog
-* Thu May 11 2017 Artur Kornacki <contact@lizardfs.org> - 3.12.0-devel
-- (none) None
+* Thu Jun 28 2018 Pawel Kalinowski <contact@lizardfs.org> - 3.13.0
+- (all) uRaft HA
+- (all) fixes to EC handling
+- (all) nfs-ganesha plugin changed to use only C code
+- (mount) reduced number of secondary groups retrievals (better performance)
+- (mount) add fuse3 client (better performance, writeback cache)
+- (all) many fixes
+
+* Wed Nov 22 2017 Pawel Kalinowski <contact@lizardfs.org> - 3.12.0
+- (all) C API
+- (all) nfs-ganesha plugin
+- (all) RichACL support (which includes NFSv4)
+- (all) OSX ACL support
+- (master, mount) file lock fixes
+- (mount) client readahead enabled by default
+- (mount) AVX2 extensions support for erasure code goals
+- (chunkserver) more flexible options
+- (all) many fixes
 
 * Tue May 9 2017 Piotr Sarna <contact@lizardfs.org> - 3.11.0
 - (master) improve ACL implementation

@@ -1,4 +1,4 @@
-timeout_set 2 minutes
+timeout_set 4 minutes
 
 # Returns number of standard chunks and number of different parts for each ec level.
 # If the same chunk has two copies of the same parts, these will be counted as one, eg:
@@ -26,9 +26,11 @@ USE_RAMDISK=YES \
 			`|12 ec22_mix: \$ec(2,2) {hdd ssd hdd ssd}`
 			`|13 ec36_mix: \$ec(3,6) {ssd ssd ssd floppy floppy floppy hdd hdd hdd}" \
 	MASTER_EXTRA_CONFIG="CHUNKS_LOOP_TIME = 1`
+			`|CHUNKS_LOOP_MAX_CPU = 90`
 			`|CHUNKS_SOFT_DEL_LIMIT = 10`
 			`|CHUNKS_WRITE_REP_LIMIT = 10`
 			`|REPLICATIONS_DELAY_INIT = 0`
+			`|CHUNKS_REBALANCING_BETWEEN_LABELS=1`
 			`|REPLICATIONS_DELAY_DISCONNECT = 0"\
 	setup_local_empty_lizardfs info
 

@@ -226,10 +226,11 @@ static nfsstat4 lzfs_fsal_getdeviceinfo(struct fsal_module *fsal_hdl, XDR *da_ad
                                         const layouttype4 type,
                                         const struct pnfs_deviceid *deviceid) {
 	struct fsal_export *export_hdl;
-	struct lzfs_fsal_export *lzfs_export;
+	struct lzfs_fsal_export *lzfs_export = NULL;
 	liz_chunk_info_t *chunk_info = NULL;
 	liz_chunkserver_info_t *chunkserver_info = NULL;
 	uint32_t chunk_count, chunkserver_count, stripe_count, chunkserver_index;
+	struct glist_head *glist, *glistn;
 	int rc;
 
 	if (type != LAYOUT4_NFSV4_1_FILES) {
@@ -237,27 +238,35 @@ static nfsstat4 lzfs_fsal_getdeviceinfo(struct fsal_module *fsal_hdl, XDR *da_ad
 		return NFS4ERR_UNKNOWN_LAYOUTTYPE;
 	}
 
-	if (glist_length(&fsal_hdl->exports) != 1) {
-		LogCrit(COMPONENT_PNFS, "Exactly one export supported");
-		return NFS4ERR_SERVERFAULT;
+	uint16_t export_id = deviceid->device_id2;
+	glist_for_each_safe(glist, glistn, &fsal_hdl->exports) {
+		export_hdl = glist_entry(glist, struct fsal_export, exports);
+		if (export_hdl->export_id == export_id) {
+			lzfs_export = container_of(export_hdl, struct lzfs_fsal_export, export);
+			break;
+		}
 	}
 
-	export_hdl = glist_first_entry(&fsal_hdl->exports, struct fsal_export, exports);
-	lzfs_export = container_of(export_hdl, struct lzfs_fsal_export, export);
+	if (!lzfs_export) {
+		LogCrit(COMPONENT_PNFS, "Couldn't find export with id: %" PRIu16, export_id);
+		return NFS4ERR_SERVERFAULT;
+	}
 
 	// get the chunk list for file
 	chunk_info = gsh_malloc(LZFS_BIGGEST_STRIPE_COUNT * sizeof(liz_chunk_info_t));
 	rc = liz_cred_get_chunks_info(lzfs_export->lzfs_instance, op_ctx->creds, deviceid->devid, 0,
 	                              chunk_info, LZFS_BIGGEST_STRIPE_COUNT, &chunk_count);
 	if (rc < 0) {
-		LogCrit(COMPONENT_PNFS, "Failed to get LizardFS layout for inode=%" PRIu64,
+		LogCrit(COMPONENT_PNFS,
+		        "Failed to get LizardFS layout for export=%" PRIu16 " inode=%" PRIu64, export_id,
 		        deviceid->devid);
 		goto generic_err;
 	}
 
 	chunkserver_info = lzfs_int_get_randomized_chunkserver_list(lzfs_export, &chunkserver_count);
 	if (chunkserver_info == NULL || chunkserver_count == 0) {
-		LogCrit(COMPONENT_PNFS, "Failed to get LizardFS layout for inode=%" PRIu64,
+		LogCrit(COMPONENT_PNFS,
+		        "Failed to get LizardFS layout for export=%" PRIu16 " inode=%" PRIu64, export_id,
 		        deviceid->devid);
 		goto generic_err;
 	}
@@ -297,7 +306,8 @@ static nfsstat4 lzfs_fsal_getdeviceinfo(struct fsal_module *fsal_hdl, XDR *da_ad
 	return NFS4_OK;
 
 encode_err:
-	LogCrit(COMPONENT_PNFS, "Failed to encode device information for inode=%" PRIu64,
+	LogCrit(COMPONENT_PNFS,
+	        "Failed to encode device information for export=%" PRIu16 " inode=%" PRIu64, export_id,
 	        deviceid->devid);
 
 generic_err:
@@ -356,7 +366,7 @@ static uint32_t lzfs_fsal_fs_maximum_segments(struct fsal_export *export_hdl) {
  * \see fsal_api.h for more information
  */
 static size_t lzfs_fsal_fs_loc_body_size(struct fsal_export *export_hdl) {
-	return 0x100; // typical value in NFS FSAL plugins
+	return 0x100;  // typical value in NFS FSAL plugins
 }
 
 /*! \brief Max Size of the buffer needed for da_addr_body in getdeviceinfo
